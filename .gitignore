@@ -1,0 +1,12 @@
+.env
+.dingtalk_debug/
+data/dingtalk_session.json
+data/user_state.json
+data/output/
+data/甲方excel/
+*.mp4
+*.zip
+*.xlsx
+__pycache__/
+*.pyc
+.DS_Store

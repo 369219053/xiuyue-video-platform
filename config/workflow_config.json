@@ -1,0 +1,24 @@
+{
+  "workflows": {
+    "workflow1":  "待填入_图片生成工作流ID",
+    "workflow2a": "待填入_生成视频",
+    "workflow2b": "待填入_检测清除字幕",
+    "workflow2c": "待填入_检测修复配音",
+    "workflow2d": "待填入_超分",
+    "workflow2e": "待填入_添加字幕"
+  },
+  "group_abbr": {
+    "何欢组":          "HH",
+    "曹心唯组":        "CXW",
+    "刘原原组":        "LYY",
+    "王威威组":        "WWW",
+    "李文晴组":        "LWQ",
+    "冯会宁组":        "FHN",
+    "燕娜组_产品1":    "YN1",
+    "燕娜组_产品2":    "YN2",
+    "唐家喜组":        "TJX",
+    "薛梦琪组":        "XMQ"
+  },
+  "skip_sheets": ["ai数量需求汇总"],
+  "double_product_sheets": ["燕娜组"]
+}

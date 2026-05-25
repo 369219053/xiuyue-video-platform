@@ -1,0 +1,3333 @@
+#!/usr/bin/env python3
+"""
+秀悦视频下载工具 - 本地 Web 服务版
+运行后自动打开浏览器，操作完全在网页上进行。
+用法：python3 src/app_server.py
+"""
+import base64
+import gzip
+import json
+import re
+import threading
+import uuid
+from pathlib import Path
+
+import subprocess
+from urllib.parse import urlencode
+
+import webview
+
+
+def _curl_get(url: str, params: dict = None, cookies: dict = None,
+              headers: dict = None, timeout: int = 20) -> dict:
+    """
+    用系统 curl 发 GET 请求，返回解析后的 JSON。
+    绕过 macOS LibreSSL 版本过旧导致的 SSLEOFError。
+    """
+    if params:
+        url = f"{url}?{urlencode(params)}"
+
+    cmd = ["curl", "-s", "-k", "--max-time", str(timeout), "--compressed"]
+
+    if headers:
+        for k, v in headers.items():
+            cmd += ["-H", f"{k}: {v}"]
+
+    if cookies:
+        cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        cmd += ["-H", f"Cookie: {cookie_str}"]
+
+    cmd.append(url)
+    result = subprocess.run(cmd, capture_output=True, timeout=timeout + 10)
+    raw = result.stdout.decode("utf-8").strip()
+    if not raw:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"curl 返回空响应 (exit={result.returncode}), stderr: {stderr}")
+    return json.loads(raw)
+
+
+def _curl_post(url: str, body: dict, headers: dict = None,
+               cookies: dict = None, timeout: int = 60,
+               retries: int = 1, retry_delay: float = 3.0) -> dict:
+    """
+    用系统 curl 发 POST JSON 请求，返回解析后的 JSON。
+    绕过 macOS LibreSSL 版本过旧导致的 SSLEOFError。
+    超时或空响应时自动重试 `retries` 次（默认 1 次，间隔 retry_delay 秒）。
+    """
+    cmd = ["curl", "-s", "-k", "--max-time", str(timeout),
+           "-X", "POST", "-H", "Content-Type: application/json"]
+    if headers:
+        for k, v in headers.items():
+            cmd += ["-H", f"{k}: {v}"]
+    if cookies:
+        cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        cmd += ["-H", f"Cookie: {cookie_str}"]
+    cmd += ["-d", json.dumps(body, ensure_ascii=False), url]
+
+    import time as _t, sys as _sys
+    last_err = None
+    total_attempts = max(1, retries + 1)
+    for attempt in range(1, total_attempts + 1):
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout + 10)
+        raw = result.stdout.decode("utf-8").strip()
+        if raw:
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as je:
+                last_err = f"JSON 解析失败 (exit={result.returncode}): {str(je)[:120]} / raw[:200]={raw[:200]}"
+        else:
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            last_err = f"curl POST 返回空响应 (exit={result.returncode}), stderr: {stderr[:200]}"
+        if attempt < total_attempts:
+            print(f"[curl-retry] 第 {attempt}/{total_attempts} 次失败：{last_err[:160]}  → {retry_delay}s 后重试",
+                  file=_sys.stderr, flush=True)
+            _t.sleep(retry_delay)
+    raise RuntimeError(f"{last_err}（已重试 {retries} 次）")
+
+
+def _get_tenant_access_token(app_id: str, app_secret: str) -> str:
+    """
+    用 app_id + app_secret 获取飞书 tenant_access_token。
+    错误时抛出异常。
+    """
+    url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+    resp = _curl_post(url, {"app_id": app_id, "app_secret": app_secret}, timeout=15)
+    code = resp.get("code", -1)
+    if code != 0:
+        raise RuntimeError(f"获取 tenant_access_token 失败：code={code} {resp.get('msg','')}")
+    token = resp.get("tenant_access_token", "")
+    if not token:
+        raise RuntimeError("tenant_access_token 为空，请检查 App ID / App Secret")
+    return token
+
+
+def _write_bitable_records(token: str, results: list,
+                           app_id: str = "", app_secret: str = "") -> list:
+    """
+    将 debug_url 结果批量写入飞书多维表格。
+    目标表格固定：PSgJbhr21aHRGosg4uHclshgnDe / tblZrh3e6CWvvSwp
+    results: [{name, debug_url, execute_id}]
+    若提供 app_id + app_secret，自动获取 tenant_access_token（推荐）；
+    否则直接使用 token（user_access_token）。
+    返回: [(ok: bool, msg: str)]
+    """
+    output = []
+    # 优先用 tenant_access_token
+    if app_id and app_secret:
+        try:
+            token = _get_tenant_access_token(app_id, app_secret)
+        except Exception as e:
+            return [(False, f"  ❌ 获取 tenant_access_token 失败：{e}")]
+    if not token:
+        return [(False, "  ❌ 未填写飞书令牌（user_access_token 或 App ID+Secret）")]
+
+    BASE_TOKEN = "PSgJbhr21aHRGosg4uHclshgnDe"
+    TABLE_ID   = "tblZrh3e6CWvvSwp"
+    url = (f"https://open.feishu.cn/open-apis/bitable/v1/apps/"
+           f"{BASE_TOKEN}/tables/{TABLE_ID}/records/batch_create")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": BROWSER_UA,
+    }
+    batch_size = 50
+    for i in range(0, len(results), batch_size):
+        batch = results[i: i + batch_size]
+        records = [{"fields": {"任务名称": r.get("name", ""), "debugurl": r.get("debug_url", "")}}
+                   for r in batch]
+        try:
+            resp = _curl_post(url, {"records": records}, headers=headers, timeout=30)
+            code = resp.get("code", -1)
+            if code == 0:
+                created = len(resp.get("data", {}).get("records", []))
+                output.append((True, f"  ✅ 写入 {created} 条记录"))
+            else:
+                msg = resp.get('msg', '')
+                hint = ""
+                if code == 99991672:
+                    hint = " → 应用缺少 bitable:app 权限，请改用 App ID + App Secret"
+                output.append((False, f"  ❌ 写入失败：code={code} {msg[:120]}{hint}"))
+        except Exception as e:
+            output.append((False, f"  ❌ 写入异常：{str(e)[:150]}"))
+    return output
+
+
+def _curl_download(url: str, dest_path: str, timeout: int = 120) -> int:
+    """
+    用系统 curl 下载文件到 dest_path，返回文件字节数。
+    """
+    cmd = [
+        "curl", "-s", "-k", "-L",
+        "--max-time", str(timeout),
+        "-H", f"User-Agent: {BROWSER_UA}",
+        "-o", dest_path,
+        url,
+    ]
+    subprocess.run(cmd, timeout=timeout + 5, check=True)
+    return Path(dest_path).stat().st_size
+from flask import Flask, Response, jsonify, render_template_string, request, stream_with_context
+
+# 钉钉在线表格同步
+from dingtalk_client import (
+    DingTalkClient, DingTalkSession,
+    scan_dingtalk_products, parse_mode_map, parse_demand_map,
+    filter_templates_by_date, find_prev_date, find_recent_dates, find_section,
+    _norm_product as _dt_norm_product,
+)
+from dingtalk_login import open_login_window
+
+# ============================================================
+# 配置
+# ============================================================
+DEFAULT_BASE_TOKEN = "J90LbKuJnaJvfWsjrIYcDJHlnSc"
+DEFAULT_FIELD_ID   = "fldksNMEZ4"
+DEFAULT_OUTPUT_DIR = str(Path("data/output/下载视频").resolve())
+FEISHU_HOST        = "https://my.feishu.cn"
+BROWSER_UA         = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/124.0.0.0 Safari/537.36")
+
+# 列表/下载/建表 时统一忽略名字包含以下任一关键词的副表（大小写不敏感）
+SKIP_TABLE_KEYWORDS = ("ai修改",)
+
+# 自动补全台词阈值：当 台词 与 最终台词 差异比例 ≥ 该值时，把 最终台词 复制到 台词
+SUBTITLE_DIFF_THRESHOLD = 0.6
+
+# 台词/最终台词列名匹配候选（按优先级，命中第一个就用）
+SCRIPT_COL_KEYWORDS    = ("台词", "人物说的话", "人物说的台词")
+SUBTITLE_COL_KEYWORDS  = ("最终台词", "最终字幕", "字幕")
+
+# ─── 视频比例规范化 ───────────────────────────────────────
+# 标准比例：(竖屏小, 横屏小, 竖屏大, 横屏大)
+STANDARD_RATIOS = [(3, 4), (4, 3), (9, 16), (16, 9)]
+# 家族判定阈值：化简后 max(W,H) <= 该值 → 小家族(3:4/4:3)，否则大家族(9:16/16:9)
+RATIO_FAMILY_THRESHOLD = 10
+# 上下文白名单：冒号前后 4 字内出现以下任一关键词才认为是视频比例
+RATIO_CONTEXT_KEYWORDS = ("比例", "屏", "竖", "横", "视频", "尺寸", "分辨率", "画面", "像素")
+RATIO_CONTEXT_WINDOW = 4
+# 数字合理范围
+RATIO_NUM_MIN = 1
+RATIO_NUM_MAX = 9999
+# 比例值合理范围（W/H），过滤掉时间戳/分数等
+RATIO_VALUE_MIN = 0.2
+RATIO_VALUE_MAX = 5.0
+
+
+def _gcd(a: int, b: int) -> int:
+    while b:
+        a, b = b, a % b
+    return a
+
+
+def _normalize_ratio(w: int, h: int) -> tuple:
+    """
+    把任意 W:H 规范化到 STANDARD_RATIOS 中最合适的一个：
+    1) 1:1 → 3:4（默认竖屏）
+    2) 先用 GCD 化简到最简分数
+    3) 保持方向（横/竖）不变
+    4) 根据化简后 max(W,H) 决定家族（≤阈值 小家族，> 阈值 大家族）
+    """
+    if w == h:
+        return (3, 4)
+    g = _gcd(w, h)
+    sw, sh = w // g, h // g
+    big = max(sw, sh)
+    vertical = sw < sh  # True 竖屏
+    if big <= RATIO_FAMILY_THRESHOLD:
+        return (3, 4) if vertical else (4, 3)
+    else:
+        return (9, 16) if vertical else (16, 9)
+
+
+def _has_ratio_context(text: str, start: int, end: int) -> bool:
+    """检查 text[start:end] 这段冒号片段前后 RATIO_CONTEXT_WINDOW 字符内是否含上下文关键词"""
+    lo = max(0, start - RATIO_CONTEXT_WINDOW)
+    hi = min(len(text), end + RATIO_CONTEXT_WINDOW)
+    window = text[lo:hi]
+    return any(k in window for k in RATIO_CONTEXT_KEYWORDS)
+
+
+_RATIO_RE = re.compile(r"(\d{1,4})[:：](\d{1,4})")
+
+
+def _fix_ratios_in_text(text: str) -> tuple:
+    """
+    扫描文本中的 W:H 模式，命中上下文白名单 + 非标准比例时替换成最近的标准比例。
+    返回：(新文本, [(原始, 规范化, 起始位置), ...])
+    """
+    if not text or not isinstance(text, str):
+        return text, []
+    fixes = []
+    out = []
+    last = 0
+    for m in _RATIO_RE.finditer(text):
+        w_s, h_s = m.group(1), m.group(2)
+        w, h = int(w_s), int(h_s)
+        s, e = m.span()
+        # 数字边界保护：左侧/右侧紧挨数字时跳过（避免 1080:1920 被匹配为 080:192）
+        if s > 0 and text[s - 1].isdigit():
+            continue
+        if e < len(text) and text[e].isdigit():
+            continue
+        # 范围过滤
+        if not (RATIO_NUM_MIN <= w <= RATIO_NUM_MAX and RATIO_NUM_MIN <= h <= RATIO_NUM_MAX):
+            continue
+        val = w / h
+        if not (RATIO_VALUE_MIN <= val <= RATIO_VALUE_MAX):
+            continue
+        # 已经是标准比例（化简后比对，比如 1080:1920 化简成 9:16 算标准）
+        g = _gcd(w, h)
+        simp = (w // g, h // g)
+        if simp in STANDARD_RATIOS:
+            continue
+        # 上下文白名单：
+        # 例外：整个单元格就是一个纯比例值（如 "1:1" 单独成格），直接规范化，无需关键词
+        is_pure_ratio_cell = _RATIO_RE.fullmatch(text.strip()) is not None
+        if not is_pure_ratio_cell and not _has_ratio_context(text, s, e):
+            continue
+        target = _normalize_ratio(w, h)
+        new_repr = f"{target[0]}:{target[1]}"
+        old_repr = f"{w}:{h}"  # 用原始数字+英文冒号，方便日志比对
+        # 累积输出
+        out.append(text[last:s])
+        out.append(new_repr)
+        last = e
+        fixes.append((m.group(0), new_repr, s))
+    if not fixes:
+        return text, []
+    out.append(text[last:])
+    return "".join(out), fixes
+
+
+def _should_skip_table(name: str) -> bool:
+    """副表名是否命中跳过关键词（大小写不敏感）"""
+    if not name:
+        return False
+    low = name.lower()
+    return any(k.lower() in low for k in SKIP_TABLE_KEYWORDS)
+
+
+def _find_col_idx(headers, keywords):
+    """
+    在 headers 列表里按 keywords 顺序找首个匹配的列索引；
+    匹配规则：列名包含 keyword（去空格后做子串判断）。
+    找不到返回 -1。
+    """
+    norm_headers = [(h or "").strip() for h in headers]
+    for kw in keywords:
+        for i, h in enumerate(norm_headers):
+            if kw in h:
+                return i
+    return -1
+
+
+def _char_diff_ratio(a: str, b: str) -> float:
+    """
+    返回两段文本的"字符级差异比例"，范围 [0, 1]。
+    使用 difflib.SequenceMatcher.ratio() 得到相似度 → 差异 = 1 - 相似度。
+    空串/全空格视为完全不同（返回 1.0），便于触发自动补全。
+    """
+    import difflib
+    sa = (a or "").strip()
+    sb = (b or "").strip()
+    if not sa and not sb:
+        return 0.0  # 两边都空：不算差异
+    if not sa or not sb:
+        return 1.0  # 一边空一边非空：差异满格
+    return 1.0 - difflib.SequenceMatcher(None, sa, sb).ratio()
+
+
+def _auto_fix_script_rows(headers, rows, threshold: float = SUBTITLE_DIFF_THRESHOLD):
+    """
+    检查每行的 "台词" 与 "最终台词"，差异 ≥ threshold 则用最终台词覆盖台词。
+    返回 (fixed_count, details)：
+      fixed_count: 被修复的行数
+      details:     [{"row": 1-based行号, "diff": 差异比例, "old": 旧值简略, "new": 新值简略}]
+    若 headers 里找不到任一列，直接返回 (0, [])。
+    """
+    s_idx = _find_col_idx(headers, SCRIPT_COL_KEYWORDS)
+    f_idx = _find_col_idx(headers, SUBTITLE_COL_KEYWORDS)
+    if s_idx < 0 or f_idx < 0 or s_idx == f_idx:
+        return 0, []
+    fixed, details = 0, []
+    for r_idx, row in enumerate(rows):
+        if s_idx >= len(row) or f_idx >= len(row):
+            continue
+        script   = row[s_idx]
+        subtitle = row[f_idx]
+        if not (subtitle or "").strip():
+            continue  # 最终台词为空，无可补全
+        diff = _char_diff_ratio(script, subtitle)
+        if diff >= threshold:
+            row[s_idx] = subtitle
+            fixed += 1
+            details.append({
+                "row":  r_idx + 1,
+                "diff": round(diff, 2),
+                "old":  (script or "")[:30],
+                "new":  (subtitle or "")[:30],
+            })
+    return fixed, details
+
+
+def _auto_fix_ratios_product(product: dict) -> tuple:
+    """
+    扫描单个产品的 title 与 rows 所有单元格，修正非标准视频比例。
+    会就地修改 product 字典。
+    返回 (fixed_count, details)：
+      fixed_count: 命中并替换的次数
+      details:     [{"where": "title"/"row N col M", "old": "5:16", "new": "9:16"}]
+    """
+    fixed, details = 0, []
+    # title
+    title = product.get("title") or ""
+    new_title, t_fixes = _fix_ratios_in_text(title)
+    if t_fixes:
+        product["title"] = new_title
+        for old, new, _ in t_fixes:
+            fixed += 1
+            details.append({"where": "title", "old": old, "new": new})
+    # rows
+    rows = product.get("rows") or []
+    for r_idx, row in enumerate(rows):
+        if not isinstance(row, list):
+            continue
+        for c_idx, cell in enumerate(row):
+            if not isinstance(cell, str):
+                continue
+            new_cell, c_fixes = _fix_ratios_in_text(cell)
+            if c_fixes:
+                row[c_idx] = new_cell
+                for old, new, _ in c_fixes:
+                    fixed += 1
+                    details.append({
+                        "where": f"row{r_idx + 1} col{c_idx + 1}",
+                        "old": old, "new": new,
+                    })
+    return fixed, details
+
+
+app = Flask(__name__)
+
+@app.after_request
+def add_cors(resp):
+    resp.headers["Access-Control-Allow-Origin"]  = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
+
+# ============================================================
+# 工具函数
+# ============================================================
+def decode_gzip_b64(b64_str: str) -> dict:
+    return json.loads(gzip.decompress(base64.b64decode(b64_str)).decode("utf-8"))
+
+
+def parse_cookie_str(cookie_str: str) -> dict:
+    cookies = {}
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            cookies[k.strip()] = v.strip()
+    return cookies
+
+
+def parse_table_name(name: str):
+    """'5.15_刘原原组_娇茵舒凝胶' → ('刘原原组', '娇茵舒凝胶')"""
+    parts = name.split("_")
+    start = 1 if len(parts) >= 3 and "." in parts[0] else 0
+    if start + 1 < len(parts):
+        return parts[start], "_".join(parts[start + 1:])
+    return name, name
+
+
+def parse_table_name3(name: str):
+    """
+    '5.15_刘原原组_娇茵舒凝胶' → ('5.15', '刘原原组', '娇茵舒凝胶')
+    无日期前缀时返回 ('', group, product)；解析失败时返回 ('', name, name)。
+    """
+    parts = name.split("_")
+    if len(parts) >= 3 and "." in parts[0]:
+        return parts[0], parts[1], "_".join(parts[2:])
+    if len(parts) >= 2:
+        return "", parts[0], "_".join(parts[1:])
+    return "", name, name
+
+
+def safe_name(name: str) -> str:
+    return re.sub(r'[<>:"/\\|?*]', "_", name)
+
+
+def fetch_clientvars(base_token, table_id, cookies, record_limit=1, need_base=False, timeout=30):
+    url = f"{FEISHU_HOST}/space/api/v1/bitable/{base_token}/clientvars"
+    params = {
+        "tableID": table_id, "recordLimit": record_limit,
+        "ondemandLimit": record_limit,
+        "needBase": "true" if need_base else "false",
+        "viewLazyLoad": "false", "ondemandVer": 2,
+        "openType": 0, "noMissCS": "true",
+        "optimizationFlag": 1, "removeFmlExtra": "false",
+    }
+    headers = {"User-Agent": BROWSER_UA,
+               "Referer": f"{FEISHU_HOST}/base/{base_token}"}
+    return _curl_get(url, params=params, cookies=cookies,
+                     headers=headers, timeout=timeout)
+
+
+def extract_videos_sorted(table_json: dict, field_id: str) -> list:
+    record_map = table_json.get("recordMap", {})
+    rank_map   = table_json.get("rankInfo", {}).get("rankMap", {})
+    out = []
+    for rec_id, rec in record_map.items():
+        val = rec.get(field_id, {}).get("value")
+        url = val[0].get("text", "") if isinstance(val, list) and val else ""
+        if url.startswith("http"):
+            out.append({"rank": rank_map.get(rec_id, "z999"), "url": url})
+    return sorted(out, key=lambda r: r["rank"])
+
+
+def diagnose_table_json(table_json: dict, field_id: str) -> dict:
+    """诊断 clientvars 返回的 table_json，分析记录数差异"""
+    record_map = table_json.get("recordMap", {})
+    rank_map   = table_json.get("rankInfo", {}).get("rankMap", {})
+    record_ids = set(record_map.keys())
+    rank_ids   = set(rank_map.keys())
+    has_video  = 0
+    no_video   = 0
+    empty_val  = 0
+    for rec_id, rec in record_map.items():
+        val = rec.get(field_id, {}).get("value")
+        if not val:
+            empty_val += 1
+        elif isinstance(val, list) and val and isinstance(val[0], dict) and val[0].get("text", "").startswith("http"):
+            has_video += 1
+        else:
+            no_video += 1
+    return {
+        "rank_total":        len(rank_ids),         # rankMap 中的记录总数
+        "record_total":      len(record_map),       # recordMap 中的记录总数
+        "missing_in_record": len(rank_ids - record_ids),  # rankMap 有但 recordMap 没有
+        "has_video":         has_video,             # 有有效视频URL的记录数
+        "no_video":          no_video,              # 视频字段格式异常
+        "empty_val":         empty_val,             # 视频字段为空
+    }
+
+
+# 内存中暂存最新 Cookie
+_cached_cookie = {"value": ""}
+
+# ============================================================
+# 持久化状态文件
+# ============================================================
+STATE_FILE = Path("data/user_state.json")
+STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+def _load_state() -> dict:
+    try:
+        if STATE_FILE.exists():
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def _save_state(data: dict):
+    try:
+        STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[state] 保存失败: {e}")
+
+
+
+# ============================================================
+# 副表自动复制任务队列
+# ============================================================
+_task_lock = threading.Lock()
+_task_list = []   # [{"id": str, "name": str, "status": "pending"|"done"}]
+
+# ============================================================
+# API 路由
+# ============================================================
+
+@app.route("/api/state", methods=["GET"])
+def get_state():
+    """加载持久化状态（配置 + 清洗数据）"""
+    return jsonify(_load_state())
+
+@app.route("/api/state", methods=["POST"])
+def save_state():
+    """保存持久化状态"""
+    body = request.get_json(force=True, silent=True) or {}
+    current = _load_state()
+    # 合并：前端传什么就更新什么，不覆盖其他字段
+    if "config" in body:
+        current.setdefault("config", {}).update(body["config"])
+    if "parsed_products" in body:
+        current["parsed_products"] = body["parsed_products"]
+    _save_state(current)
+    return jsonify({"ok": True})
+
+
+# ── 单个清洗产品 JSON 的写回 / 删除 ─────────────────────────────────────────
+def _parsed_json_path(key: str) -> Path:
+    """key 形如 5.16_刘原原组_娇茵舒凝胶 → data/input/parsed/5.16/5.16_刘原原组_娇茵舒凝胶.json"""
+    date = key.split('_', 1)[0] if key else '未知日期'
+    return Path("data/input/parsed") / date / f"{key}.json"
+
+
+@app.route("/api/save-parsed-product", methods=["POST"])
+def save_parsed_product():
+    """把单个清洗产品的最新内容写回磁盘 JSON"""
+    body = request.get_json(force=True, silent=True) or {}
+    key     = (body.get("key") or "").strip()
+    title   = body.get("title", "")
+    headers = body.get("headers", []) or []
+    rows    = body.get("rows", []) or []
+
+    if not key:
+        return jsonify({"ok": False, "msg": "缺少 key"})
+
+    out_file = _parsed_json_path(key)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    header_str = ' // '.join(str(h) for h in headers)
+    row_strs   = [' // '.join('' if c is None else str(c) for c in row) for row in rows]
+    json_data  = [title, header_str] + row_strs
+
+    try:
+        out_file.write_text(
+            json.dumps(json_data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return jsonify({"ok": True, "path": str(out_file)})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)})
+
+
+@app.route("/api/delete-parsed-product", methods=["POST"])
+def delete_parsed_product():
+    """删除磁盘上的单个清洗产品 JSON 文件"""
+    body = request.get_json(force=True, silent=True) or {}
+    key  = (body.get("key") or "").strip()
+    if not key:
+        return jsonify({"ok": False, "msg": "缺少 key"})
+
+    out_file = _parsed_json_path(key)
+    try:
+        if out_file.exists():
+            out_file.unlink()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)})
+
+
+@app.route("/api/set-cookie", methods=["POST", "OPTIONS"])
+def set_cookie():
+    """篡改猴脚本调用此接口自动注入 Cookie"""
+    # 处理 CORS 预检
+    if request.method == "OPTIONS":
+        resp = Response("", status=200)
+        resp.headers["Access-Control-Allow-Origin"]  = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        return resp
+    body = request.json or {}
+    cookie_val = body.get("cookie", "").strip()
+    if cookie_val:
+        _cached_cookie["value"] = cookie_val
+        return jsonify({"ok": True, "msg": f"Cookie 已接收，共 {len(cookie_val)} 字符"})
+    return jsonify({"ok": False, "msg": "Cookie 为空"})
+
+
+@app.route("/api/get-cookie", methods=["GET"])
+def get_cookie():
+    """前端页面轮询拿最新 Cookie"""
+    return jsonify({"ok": True, "cookie": _cached_cookie["value"]})
+
+
+# ============================================================
+# 副表自动复制任务管理接口（供篡改猴脚本调用）
+# ============================================================
+
+@app.route("/api/add-tasks", methods=["POST", "OPTIONS"])
+def add_tasks():
+    """UI 批量添加复制任务"""
+    if request.method == "OPTIONS":
+        return Response("", status=200)
+    body = request.json or {}
+    names = body.get("names", [])
+    added = 0
+    with _task_lock:
+        for name in names:
+            name = name.strip()
+            if name:
+                _task_list.append({"id": str(uuid.uuid4())[:8], "name": name, "status": "pending"})
+                added += 1
+    return jsonify({"ok": True, "added": added, "total": len(_task_list)})
+
+
+@app.route("/api/task-list", methods=["GET"])
+def task_list_api():
+    """获取全部任务状态"""
+    with _task_lock:
+        return jsonify({"ok": True, "tasks": list(_task_list)})
+
+
+@app.route("/api/get-task", methods=["GET", "OPTIONS"])
+def get_task():
+    """篡改猴脚本轮询：获取下一个 pending 任务"""
+    if request.method == "OPTIONS":
+        return Response("", status=200)
+    with _task_lock:
+        for task in _task_list:
+            if task["status"] == "pending":
+                return jsonify({"ok": True, "task": task})
+    return jsonify({"ok": True, "task": None})
+
+
+@app.route("/api/complete-task", methods=["POST", "OPTIONS"])
+def complete_task():
+    """篡改猴脚本回报：任务完成"""
+    if request.method == "OPTIONS":
+        return Response("", status=200)
+    body = request.json or {}
+    task_id = body.get("id", "")
+    with _task_lock:
+        for task in _task_list:
+            if task["id"] == task_id:
+                task["status"] = "done"
+                return jsonify({"ok": True})
+    return jsonify({"ok": False, "msg": "任务不存在"})
+
+
+@app.route("/api/clear-tasks", methods=["POST", "OPTIONS"])
+def clear_tasks():
+    """清空任务列表"""
+    if request.method == "OPTIONS":
+        return Response("", status=200)
+    with _task_lock:
+        _task_list.clear()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/right-click", methods=["POST", "OPTIONS"])
+def do_right_click():
+    """
+    用 PyAutoGUI 执行真实系统级右键点击。
+    篡改猴脚本把屏幕坐标发过来，这里触发 OS-level 鼠标事件，
+    浏览器收到的是可信事件（isTrusted=true），飞书菜单正常弹出。
+    """
+    if request.method == "OPTIONS":
+        return Response("", status=200)
+    body = request.json or {}
+    x = int(body.get("x", 0))
+    y = int(body.get("y", 0))
+    try:
+        import pyautogui
+        pyautogui.rightClick(x, y)
+        return jsonify({"ok": True})
+    except ImportError:
+        return jsonify({"ok": False, "msg": "pyautogui 未安装，请运行: pip3 install pyautogui"})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)})
+
+
+@app.route("/api/launch-edge", methods=["POST", "OPTIONS"])
+def launch_edge():
+    """启动 Edge 调试模式，供 Playwright CDP 连接（不占鼠标）"""
+    if request.method == "OPTIONS":
+        return Response("", status=200)
+    import platform
+    system = platform.system()
+    body = request.json or {}
+    feishu_url = body.get("url", "")
+    # 独立的用户数据目录，避免被已运行的 Edge 实例接管
+    debug_profile = str(Path.home() / ".edge-debug-profile")
+    try:
+        if system == "Darwin":
+            edge_path = "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
+            if not Path(edge_path).exists():
+                return jsonify({"ok": False, "msg": "未找到 Microsoft Edge，请手动启动"})
+            cmd = [edge_path,
+                   "--remote-debugging-port=9222",
+                   "--no-first-run",
+                   f"--user-data-dir={debug_profile}"]
+            if feishu_url:
+                cmd.append(feishu_url)
+            subprocess.Popen(cmd)
+        elif system == "Windows":
+            edge_path = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+            cmd = [edge_path,
+                   "--remote-debugging-port=9222",
+                   "--no-first-run",
+                   f"--user-data-dir={debug_profile}"]
+            if feishu_url:
+                cmd.append(feishu_url)
+            subprocess.Popen(cmd)
+        else:
+            return jsonify({"ok": False, "msg": f"不支持的系统：{system}"})
+        tip = "并已自动打开飞书多维表格，稍等页面加载完再点「一键执行」" if feishu_url else "请在调试版 Edge 里打开飞书多维表格"
+        return jsonify({"ok": True, "msg": f"Edge 已启动（调试端口 9222），{tip}"})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)})
+
+
+@app.route("/api/cdp-copy", methods=["POST", "OPTIONS"])
+def cdp_copy():
+    """一键全流程：自动加队列 → 自动启动Edge → 自动执行复制，完全不占鼠标"""
+    if request.method == "OPTIONS":
+        return Response("", status=200)
+
+    body       = request.json or {}
+    names      = body.get("names", [])   # 前端直接传名称列表
+    base_token = body.get("baseToken", DEFAULT_BASE_TOKEN)
+    feishu_url = f"https://my.feishu.cn/base/{base_token}" if base_token else ""
+
+    # 如果前端传来了名称，先加入队列
+    if names:
+        import uuid
+        with _task_lock:
+            for n in names:
+                n = n.strip()
+                if n:
+                    _task_list.append({"id": uuid.uuid4().hex[:8], "name": n, "status": "pending"})
+
+    def generate():
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            yield f"data: {json.dumps({'msg': '❌ playwright 未安装，请运行: pip3 install playwright && playwright install chromium'})}\n\n"
+            yield "data: __DONE__\n\n"
+            return
+
+        import platform, time
+        system = platform.system()
+        debug_profile = str(Path.home() / ".edge-debug-profile")
+
+        # ① 尝试连接，连不上就自动启动 Edge
+        yield f"data: {json.dumps({'msg': '🔌 正在连接 Edge 调试端口...'})}\n\n"
+
+        try:
+            browser = None
+            with sync_playwright() as p:
+                for attempt in range(1, 4):
+                    try:
+                        browser = p.chromium.connect_over_cdp("http://localhost:9222")
+                        break
+                    except Exception:
+                        if attempt == 1:
+                            yield f"data: {json.dumps({'msg': '🚀 Edge 未启动，正在自动启动...'})}\n\n"
+                            try:
+                                if system == "Darwin":
+                                    edge_path = "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
+                                    cmd = [edge_path, "--remote-debugging-port=9222",
+                                           "--no-first-run", f"--user-data-dir={debug_profile}"]
+                                    if feishu_url:
+                                        cmd.append(feishu_url)
+                                    subprocess.Popen(cmd)
+                                elif system == "Windows":
+                                    edge_path = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+                                    cmd = [edge_path, "--remote-debugging-port=9222",
+                                           "--no-first-run", f"--user-data-dir={debug_profile}"]
+                                    if feishu_url:
+                                        cmd.append(feishu_url)
+                                    subprocess.Popen(cmd)
+                            except Exception as e2:
+                                yield f"data: {json.dumps({'msg': '❌ 启动 Edge 失败：' + str(e2)[:100]})}\n\n"
+                                yield "data: __DONE__\n\n"
+                                return
+                        wait = attempt * 4
+                        yield f"data: {json.dumps({'msg': f'⏳ 等待 Edge 启动... ({wait}s)'})}\n\n"
+                        time.sleep(wait)
+
+                if browser is None:
+                    yield f"data: {json.dumps({'msg': '❌ 无法连接 Edge，请手动点击「启动 Edge 调试模式」后重试'})}\n\n"
+                    yield "data: __DONE__\n\n"
+                    return
+
+                # ② 找飞书多维表格页面，找不到就等待加载
+                yield f"data: {json.dumps({'msg': '🔍 正在查找飞书多维表格页面...'})}\n\n"
+                page = None
+                for _ in range(10):
+                    for context in browser.contexts:
+                        for pg in context.pages:
+                            if "feishu.cn/base/" in pg.url:
+                                page = pg
+                                break
+                        if page:
+                            break
+                    if page:
+                        break
+                    time.sleep(2)
+
+                if not page:
+                    yield f"data: {json.dumps({'msg': '❌ 未找到飞书多维表格页面，请在 Edge 中打开 my.feishu.cn/base/...'})}\n\n"
+                    yield "data: __DONE__\n\n"
+                    browser.close()
+                    return
+
+                yield f"data: {json.dumps({'msg': '✅ 找到页面：' + page.url[:80]})}\n\n"
+
+                # 等页面加载完毕
+                try:
+                    page.wait_for_load_state("networkidle", timeout=20000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(2000)
+
+                # ③ 获取待执行任务
+                with _task_lock:
+                    pending = [t.copy() for t in _task_list if t["status"] == "pending"]
+
+                if not pending:
+                    yield f"data: {json.dumps({'msg': '⚠️ 没有待执行的任务，请先粘贴副表名称'})}\n\n"
+                    yield "data: __DONE__\n\n"
+                    browser.close()
+                    return
+
+                yield f"data: {json.dumps({'msg': f'📋 共 {len(pending)} 个任务，开始执行...'})}\n\n"
+
+                for task in pending:
+                    task_name = task['name']
+                    task_id   = task['id']
+                    try:
+                        yield f"data: {json.dumps({'msg': '⏳ 执行：' + task_name})}\n\n"
+
+                        # 右键当前激活（高亮）的副表标签
+                        active_tab = page.locator('.bitable-new-table-item.bitable-new-table-item__active')
+                        active_tab.click(button='right')
+
+                        # 等菜单并点"复制数据表"
+                        copy_item = page.locator('li.b-menu__item').filter(has_text='复制数据表').first
+                        copy_item.click(timeout=6000)
+
+                        # 等输入框、填名称
+                        inp = page.locator('input[placeholder="请输入数据表名称"]').first
+                        inp.wait_for(timeout=8000)
+                        inp.fill(task_name)
+
+                        # 点确认
+                        confirm_btn = page.locator('.ud__portal button').filter(has_text='复制').first
+                        confirm_btn.click(timeout=5000)
+
+                        # 等待复制完成
+                        page.wait_for_timeout(2500)
+
+                        # 标记完成
+                        with _task_lock:
+                            for t in _task_list:
+                                if t['id'] == task_id:
+                                    t['status'] = 'done'
+
+                        yield f"data: {json.dumps({'msg': '✅ 完成：' + task_name})}\n\n"
+
+                    except Exception as e:
+                        err = str(e)[:150]
+                        yield f"data: {json.dumps({'msg': '❌ 失败：' + task_name + ' → ' + err})}\n\n"
+                        # 关掉可能残留的菜单/弹窗
+                        try:
+                            page.keyboard.press('Escape')
+                            page.wait_for_timeout(500)
+                        except Exception:
+                            pass
+
+                yield f"data: {json.dumps({'msg': '🎉 所有任务执行完毕！'})}\n\n"
+                browser.close()
+
+        except Exception as e:
+            yield f"data: {json.dumps({'msg': f'❌ 系统错误：{str(e)[:200]}'})}\n\n"
+
+        yield "data: __DONE__\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
+    )
+
+
+@app.route("/api/tables", methods=["POST"])
+def get_tables():
+    body       = request.json
+    cookies    = parse_cookie_str(body.get("cookie", ""))
+    base_token = body.get("baseToken", DEFAULT_BASE_TOKEN)
+    main_tid   = body.get("mainTableId", "tbl4VYxV0caXJEEn")
+
+    if not cookies:
+        return jsonify({"ok": False, "msg": "Cookie 不能为空"})
+    try:
+        data = fetch_clientvars(base_token, main_tid, cookies,
+                                record_limit=1, need_base=True)
+        if data.get("code") != 0:
+            return jsonify({"ok": False, "msg": f"飞书接口错误: {data.get('msg', data)}"})
+        block_infos = decode_gzip_b64(data["data"]["base"]).get("blockInfos", {})
+        tables = [
+            {"id": bid, "name": info.get("name", "")}
+            for bid, info in block_infos.items()
+            if bid.startswith("tbl") and info.get("name", "")
+               and not _should_skip_table(info.get("name", ""))
+        ]
+        return jsonify({"ok": True, "tables": tables})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)})
+
+
+@app.route("/api/tables-multi", methods=["POST"])
+def get_tables_multi():
+    """一次拉取多个 Base 的副表列表，按 Base 分组返回"""
+    body        = request.json or {}
+    cookies     = parse_cookie_str(body.get("cookie", ""))
+    base_tokens = [t.strip() for t in (body.get("baseTokens") or []) if t and t.strip()]
+    main_tid    = body.get("mainTableId", "tbl4VYxV0caXJEEn")
+
+    if not cookies:
+        return jsonify({"ok": False, "msg": "Cookie 不能为空"})
+    if not base_tokens:
+        return jsonify({"ok": False, "msg": "至少需要 1 个 Base Token"})
+
+    results = []
+    for bt in base_tokens:
+        try:
+            data = fetch_clientvars(bt, main_tid, cookies,
+                                    record_limit=1, need_base=True)
+            if data.get("code") != 0:
+                results.append({"baseToken": bt, "ok": False,
+                                "msg": f"飞书接口错误: {data.get('msg', data)}",
+                                "tables": []})
+                continue
+            block_infos = decode_gzip_b64(data["data"]["base"]).get("blockInfos", {})
+            tables = [
+                {"id": bid, "name": info.get("name", "")}
+                for bid, info in block_infos.items()
+                if bid.startswith("tbl") and info.get("name", "")
+                   and not _should_skip_table(info.get("name", ""))
+            ]
+            results.append({"baseToken": bt, "ok": True, "tables": tables})
+        except Exception as e:
+            results.append({"baseToken": bt, "ok": False,
+                            "msg": str(e)[:200], "tables": []})
+    return jsonify({"ok": True, "results": results})
+
+
+def _download_one_base(tag, base_token, field_id, tables, cookies,
+                       output_dir, force_redown, min_size_bytes, emit,
+                       make_zip=True, delete_after_zip=False):
+    """
+    单 Base 串行下载所有副表。
+    emit(msg) 把消息推到外面的 queue（带 tag 前缀）。
+    make_zip: 整个副表下完后是否在第一层目录下生成 {date_product}.zip
+    delete_after_zip: 打包成功后是否删除原文件夹（仅 make_zip=True 时生效）
+    返回 stats dict：{new, skipped, repaired, zipped}
+    """
+    import zipfile, shutil
+    stats = {"new": 0, "skipped": 0, "repaired": 0, "zipped": 0}
+    for idx, table in enumerate(tables):
+        name           = table["name"]
+        tid            = table["id"]
+        date, group, product = parse_table_name3(name)
+        date_dir = output_dir / safe_name(date) if date else output_dir
+        emit(f"\n📂 {tag} [{idx+1}/{len(tables)}] {name}")
+        emit(f"   {tag} → 保存到: {safe_name(date) if date else '.'}/{safe_name(name)}/")
+        try:
+            data = fetch_clientvars(base_token, tid, cookies,
+                                    record_limit=2000, need_base=False, timeout=60)
+            if data.get("code") != 0:
+                emit(f"   {tag} ❌ 接口错误: {data.get('msg')}")
+                continue
+            table_json = decode_gzip_b64(data["data"]["table"])
+            diag = diagnose_table_json(table_json, field_id)
+            emit(f"   {tag} 🔎 诊断: rankMap={diag['rank_total']} / recordMap={diag['record_total']}"
+                 f" / 有视频={diag['has_video']} / 空={diag['empty_val']} / 格式异常={diag['no_video']}")
+            if diag["missing_in_record"] > 0:
+                emit(f"   {tag} ⚠️  飞书按需加载未返回完整数据：{diag['missing_in_record']} 条记录缺失")
+            records = extract_videos_sorted(table_json, field_id)
+            emit(f"   {tag} 共 {len(records)} 条视频")
+            if not records:
+                emit(f"   {tag} ⚠️  该副表暂无视频数据，跳过")
+                continue
+            # 结构：output_dir / 任务日期 / 副表名文件夹
+            save_dir = date_dir / safe_name(name)
+            save_dir.mkdir(parents=True, exist_ok=True)
+            prefix = safe_name(name)  # 文件名前缀 = 副表名
+
+            stat_complete = stat_broken = stat_missing = 0
+            for i in range(1, len(records) + 1):
+                fpath = save_dir / f"{prefix}_{i}.mp4"
+                if not fpath.exists():
+                    stat_missing += 1
+                elif fpath.stat().st_size < min_size_bytes:
+                    stat_broken += 1
+                else:
+                    stat_complete += 1
+            emit(f"   {tag} 📋 本地状态: 完整={stat_complete} / 残缺={stat_broken} / 缺失={stat_missing}"
+                 + ("  → 强制覆盖全部" if force_redown else ""))
+
+            for i, rec in enumerate(records, 1):
+                fname = f"{prefix}_{i}.mp4"
+                fpath = save_dir / fname
+
+                if fpath.exists() and not force_redown:
+                    sz = fpath.stat().st_size
+                    if sz >= min_size_bytes:
+                        emit(f"   {tag} ⏭  已完整: {fname} ({sz/1024/1024:.1f} MB)")
+                        stats["skipped"] += 1
+                        continue
+                    else:
+                        emit(f"   {tag} 🔧 残缺重下: {fname} (本地 {sz/1024:.1f} KB < 阈值)")
+                        try: fpath.unlink()
+                        except Exception: pass
+                        is_repair = True
+                else:
+                    is_repair = False
+                    if fpath.exists():
+                        try: fpath.unlink()
+                        except Exception: pass
+                        emit(f"   {tag} 🔄 覆盖重下: {fname}")
+                    else:
+                        emit(f"   {tag} ⬇  {fname}")
+
+                try:
+                    size = _curl_download(rec["url"], str(fpath), timeout=120)
+                    mb = size / 1024 / 1024
+                    if size < min_size_bytes:
+                        emit(f"   {tag} ⚠️  {fname} 下完只有 {size/1024:.1f} KB（< 阈值），可能仍然异常")
+                    else:
+                        emit(f"   {tag} ✅ {fname}  ({mb:.1f} MB)")
+                    stats["new"] += 1
+                    if is_repair:
+                        stats["repaired"] += 1
+                except Exception as e:
+                    emit(f"   {tag} ❌ 下载失败: {e}")
+
+            # ── 副表全部下完：可选打包 zip / 删除原文件夹 ──
+            if make_zip:
+                try:
+                    mp4_files = sorted(save_dir.glob("*.mp4"))
+                    if not mp4_files:
+                        emit(f"   {tag} ⚠️  没有 mp4 可打包，跳过 zip")
+                    else:
+                        zip_path = date_dir / f"{safe_name(name)}.zip"
+                        if zip_path.exists():
+                            try: zip_path.unlink()
+                            except Exception: pass
+                        total_bytes = 0
+                        with zipfile.ZipFile(zip_path, "w",
+                                             compression=zipfile.ZIP_STORED) as zf:
+                            for mp4 in mp4_files:
+                                zf.write(mp4, arcname=mp4.name)
+                                total_bytes += mp4.stat().st_size
+                        zip_mb = zip_path.stat().st_size / 1024 / 1024
+                        emit(f"   {tag} 📦 已打包: {zip_path.name}  "
+                             f"({len(mp4_files)} 个 / {zip_mb:.1f} MB)")
+                        stats["zipped"] += 1
+                        if delete_after_zip:
+                            try:
+                                shutil.rmtree(save_dir)
+                                emit(f"   {tag} 🗑  已删除原文件夹: {save_dir.name}/")
+                            except Exception as _e:
+                                emit(f"   {tag} ⚠️  删除原文件夹失败: {_e}")
+                except Exception as e:
+                    emit(f"   {tag} ❌ 打包 zip 失败: {e}")
+        except Exception as e:
+            emit(f"   {tag} ❌ 出错: {e}")
+    return stats
+
+
+@app.route("/api/download", methods=["POST"])
+def download_videos():
+    """SSE 流式推送下载进度（多 Base 并行 + 单 Base 内串行）"""
+    body            = request.json or {}
+    cookies         = parse_cookie_str(body.get("cookie", ""))
+    output_dir      = Path(body.get("outputDir", DEFAULT_OUTPUT_DIR))
+    default_field   = (body.get("defaultFieldId") or body.get("fieldId")
+                       or DEFAULT_FIELD_ID).strip()
+    force_redown    = bool(body.get("forceRedownload", False))
+    min_size_bytes  = max(0, int(body.get("minSizeKb", 50))) * 1024
+    make_zip        = bool(body.get("makeZip", True))
+    delete_after_zip = bool(body.get("deleteAfterZip", False))
+
+    # 兼容新版 bases 数组 + 旧版单 base 平铺字段
+    bases = body.get("bases") or []
+    if not bases:
+        bases = [{
+            "baseToken": body.get("baseToken", DEFAULT_BASE_TOKEN),
+            "fieldId":   body.get("fieldId", DEFAULT_FIELD_ID),
+            "tables":    body.get("tables", []),
+        }]
+    # 规整 + 过滤空桶
+    cleaned = []
+    for b in bases:
+        bt = (b.get("baseToken") or "").strip()
+        ts = b.get("tables") or []
+        if not bt or not ts:
+            continue
+        cleaned.append({
+            "baseToken": bt,
+            "fieldId":  (b.get("fieldId") or "").strip() or default_field,
+            "tables":   ts,
+        })
+    bases = cleaned
+
+    def generate():
+        import queue as _queue
+        from concurrent.futures import ThreadPoolExecutor
+
+        def send(msg):
+            return f"data: {json.dumps({'msg': msg}, ensure_ascii=False)}\n\n"
+
+        strategy = ("🔄 强制重新下载（覆盖已存在）" if force_redown
+                    else f"📊 增量补齐模式（残缺阈值 {min_size_bytes // 1024} KB）")
+        zip_strategy = ("📦 下完自动打包 zip" +
+                        ("（打包后删除原文件夹）" if delete_after_zip else "（保留原文件夹）")
+                        ) if make_zip else "📁 仅下载文件夹（不打包）"
+        yield send(f"⚙️  策略: {strategy}")
+        yield send(f"⚙️  打包: {zip_strategy}")
+        if not bases:
+            yield send("❌ 未选择任何副表，停止"); yield "data: __DONE__\n\n"; return
+
+        def _base_tag(idx, b):
+            nm = (b.get("name") or "").strip()
+            return f"[Base #{idx+1} · {nm}]" if nm else f"[Base #{idx+1}]"
+
+        yield send(f"🧱 共 {len(bases)} 个 Base 并行下载（单 Base 内串行）")
+        for i, b in enumerate(bases, 1):
+            yield send(f"  {_base_tag(i-1, b)} {b['baseToken'][:14]}...  fieldId={b['fieldId']}  副表={len(b['tables'])} 个")
+
+        q = _queue.Queue()
+        SENTINEL = object()
+
+        def worker(idx, b):
+            tag = _base_tag(idx, b)
+            try:
+                stats = _download_one_base(
+                    tag, b["baseToken"], b["fieldId"], b["tables"], cookies,
+                    output_dir, force_redown, min_size_bytes,
+                    lambda m: q.put(m),
+                    make_zip=make_zip, delete_after_zip=delete_after_zip)
+                zip_tip = f"，打包 {stats.get('zipped', 0)} 个 zip" if make_zip else ""
+                q.put(f"\n✅ {tag} 完成：新下载 {stats['new']}（含残缺修复 {stats['repaired']}），跳过 {stats['skipped']}{zip_tip}")
+                return stats
+            except Exception as e:
+                q.put(f"\n❌ {tag} 异常退出：{str(e)[:200]}")
+                return {"new": 0, "skipped": 0, "repaired": 0, "zipped": 0}
+            finally:
+                q.put(SENTINEL)
+
+        with ThreadPoolExecutor(max_workers=len(bases)) as ex:
+            futures = [ex.submit(worker, i, b) for i, b in enumerate(bases)]
+            done_count = 0
+            totals = {"new": 0, "skipped": 0, "repaired": 0, "zipped": 0}
+            while done_count < len(bases):
+                msg = q.get()
+                if msg is SENTINEL:
+                    done_count += 1
+                    continue
+                yield send(msg)
+            for fut in futures:
+                try:
+                    s = fut.result()
+                    for k in totals: totals[k] += s.get(k, 0)
+                except Exception:
+                    pass
+
+        zip_summary = f"，共打包 {totals['zipped']} 个 zip" if make_zip else ""
+        yield send(f"\n🎉 全部完成！新下载 {totals['new']} 个"
+                   f"（其中残缺修复 {totals['repaired']} 个），跳过已完整 {totals['skipped']} 个{zip_summary}")
+        yield send(f"   保存位置: {output_dir.resolve()}")
+        yield "data: __DONE__\n\n"
+
+    return Response(stream_with_context(generate()),
+                    content_type="text/event-stream")
+
+
+
+# ============================================================
+# Excel 清洗路由
+# ============================================================
+@app.route("/api/parse-excel", methods=["POST"])
+def parse_excel_route():
+    """
+    手动模式：接收上传的 Excel + 用户提供的批次日期。
+    只扫描所有数据 sheet 的产品段落，不读需求汇总表，不扩展。
+    返回每个产品的原始模版与表头，供前端展示给用户手动指定数量后再调 /api/expand-product。
+    """
+    import tempfile, os, traceback, time as _time, sys as _sys
+    _t_route = _time.time()
+    if 'file' not in request.files:
+        return jsonify({"ok": False, "msg": "没有收到文件"})
+    file = request.files['file']
+    if not file.filename.lower().endswith('.xlsx'):
+        return jsonify({"ok": False, "msg": "请上传 .xlsx 格式的文件"})
+
+    batch_date = (request.form.get('batch_date') or '').strip()
+    if not batch_date:
+        return jsonify({"ok": False, "msg": "请先填写批次日期（如 5.21.）"})
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+            file.save(tmp.name)
+            tmp_path = tmp.name
+        try:
+            _size_mb = os.path.getsize(tmp_path) / 1024 / 1024
+        except Exception:
+            _size_mb = -1
+        print(f"[parse-excel] 收到上传：{file.filename}  ({_size_mb:.2f} MB)  批次={batch_date}  → {tmp_path}", flush=True)
+
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent))
+        from excel_parser import scan_products
+
+        _t_parse = _time.time()
+        raw_sections = scan_products(tmp_path)  # [{sheet, title, product_name, header_str, col_count, templates, template_count}]
+        print(f"[parse-excel] scan_products 完成：{len(raw_sections)} 个段落  耗时={_time.time()-_t_parse:.1f}s", flush=True)
+
+        if not raw_sections:
+            try:
+                import openpyxl as _opx
+                _wb = _opx.load_workbook(tmp_path, data_only=True)
+                _sheets = [s for s in _wb.sheetnames if s != 'ai数量需求汇总']
+                _diag = (f"📂 工作簿数据 Sheet 列表：{_sheets or '(空)'}\n"
+                         f"💡 任何 Sheet 内都没有扫到合法的产品段落，请检查 Excel 结构（产品标题行 + 表头行 + 数据行）")
+                return jsonify({"ok": False,
+                                "msg": "未扫描到任何产品段落，请检查 Excel 结构",
+                                "detail": _diag})
+            except Exception as _de:
+                return jsonify({"ok": False,
+                                "msg": "未扫描到任何产品段落，且诊断失败",
+                                "detail": str(_de)[:400]})
+
+        parsed = []
+        for sec in raw_sections:
+            sheet_name   = sec['sheet']
+            title        = sec['title']
+            product_name = sec['product_name']
+            header_str   = sec['header_str']
+            headers      = [h.strip() for h in header_str.split(' // ')]
+            file_key     = f'{batch_date}_{sheet_name}_{product_name}'
+            parsed.append({
+                "key":            file_key,
+                "title":          title,
+                "product_name":   product_name,
+                "sheet":          sheet_name,
+                "batch_date":     batch_date,
+                "headers":        headers,
+                "header_str":     header_str,
+                "templates":      sec['templates'],
+                "template_count": sec['template_count'],
+                "rows":           [],
+                "count":          0,
+            })
+
+        print(f"[parse-excel] 扫描完成：{len(parsed)} 个产品  总耗时={_time.time()-_t_route:.1f}s", flush=True)
+        return jsonify({"ok": True, "results": parsed, "total": len(parsed),
+                        "batch_date": batch_date,
+                        # 字段保留以兼容旧前端代码
+                        "auto_fixed_total": 0, "auto_fixed_summary": [],
+                        "ratio_fixed_total": 0, "ratio_fixed_summary": []})
+    except Exception as e:
+        _tb = traceback.format_exc()
+        print(f"[parse-excel] ❌ 异常（耗时={_time.time()-_t_route:.1f}s）：{e}\n{_tb}", file=_sys.stderr, flush=True)
+        return jsonify({"ok": False, "msg": str(e), "detail": _tb[:2000]})
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
+@app.route("/api/expand-product", methods=["POST"])
+def expand_product_route():
+    """
+    单产品扩展：前端在用户为某产品填入数量后调用本接口。
+    入参 JSON：
+      {
+        templates: [str],      # 原始模版行
+        header_str: str,       # 表头
+        count: int,            # 用户指定的目标条数
+        batch_date: str,       # 批次日期（落地目录用）
+        sheet: str,            # 工作表名（文件名用）
+        title: str,            # 产品标题（含括号），文件名取去括号版
+      }
+    返回 { ok, file_key, rows: [[col, ...]], headers, count, auto_fixed, ratio_fixed }
+    """
+    import traceback, sys as _sys
+    try:
+        data = request.get_json(silent=True) or {}
+        templates  = data.get('templates') or []
+        header_str = (data.get('header_str') or '').strip()
+        count      = int(data.get('count') or 0)
+        batch_date = (data.get('batch_date') or '').strip()
+        sheet_name = (data.get('sheet') or '').strip()
+        title      = (data.get('title') or '').strip()
+        if not templates or not header_str or count <= 0 or not batch_date or not sheet_name or not title:
+            return jsonify({"ok": False, "msg": "参数缺失（templates/header_str/count/batch_date/sheet/title 必填，且 count>0）"})
+
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent))
+        from excel_parser import expand_product
+
+        result = expand_product(templates, header_str, count, batch_date, sheet_name, title)
+        json_data = result['rows']  # [title, header_str, row1, row2, ...]
+        headers = [h.strip() for h in header_str.split(' // ')]
+        parsed_rows = []
+        for row in json_data[2:]:
+            cols = [c.strip() for c in row.split(' // ')]
+            while len(cols) < len(headers):
+                cols.append('/')
+            parsed_rows.append(cols[:len(headers)])
+
+        # 后处理：台词/比例修复（与旧 parse 路径保持一致）
+        fixed_n, fix_details = _auto_fix_script_rows(headers, parsed_rows)
+        product_obj = {"title": title, "rows": parsed_rows}
+        r_fixed, r_details = _auto_fix_ratios_product(product_obj)
+        title_fixed = product_obj["title"]
+
+        if fixed_n or r_fixed:
+            # 修复后回写磁盘，保证 JSON 文件与前端展示一致
+            try:
+                from pathlib import Path as _P
+                import json as _json
+                out_path = _P(result['out_path'])
+                new_rows = [' // '.join(c for c in row) for row in parsed_rows]
+                _data = [title_fixed, header_str] + new_rows
+                with open(out_path, 'w', encoding='utf-8') as _f:
+                    _json.dump(_data, _f, ensure_ascii=False, indent=2)
+            except Exception as _we:
+                print(f"[expand-product] 回写修复结果失败：{_we}", file=_sys.stderr, flush=True)
+
+        return jsonify({
+            "ok": True,
+            "file_key":    result['file_key'],
+            "title":       title_fixed,
+            "headers":     headers,
+            "header_str":  header_str,
+            "rows":        parsed_rows,
+            "count":       len(parsed_rows),
+            "auto_fixed":  fixed_n,
+            "ratio_fixed": r_fixed,
+            "auto_fixed_summary":  fix_details[:5],
+            "ratio_fixed_summary": r_details[:5],
+        })
+    except Exception as e:
+        _tb = traceback.format_exc()
+        print(f"[expand-product] ❌ 异常：{e}\n{_tb}", file=_sys.stderr, flush=True)
+        return jsonify({"ok": False, "msg": str(e), "detail": _tb[:2000]})
+
+
+# ============================================================
+# 全流程自动化路由
+# ============================================================
+def _call_coze_sync(token: str, workflow_id: str, input_data: list, name: str,
+                    timeout: int = 15) -> dict:
+    """
+    触发 Coze 工作流（fire-and-forget）。
+    只要请求发出、Coze 服务端收到即视为成功，不等工作流执行结果。
+    超时 15 秒：足够建连 + 发送请求体，到时间直接返回成功。
+    retries=0：绝不重复触发。
+    """
+    url = 'https://api.coze.cn/v1/workflow/run'
+    body = {
+        'workflow_id': workflow_id,
+        'parameters': {
+            'input': input_data,
+            'name':  name,
+        }
+    }
+    headers = {'Authorization': f'Bearer {token}'}
+    try:
+        return _curl_post(url, body, headers=headers, timeout=timeout, retries=0)
+    except RuntimeError:
+        # curl 超时 = 请求已发出，Coze 正在执行中，视为成功
+        return {"code": 0, "msg": "已触发"}
+
+
+def _next_subtable_candidate(name: str) -> str:
+    """末尾 _数字 → 自增；否则追加 _2。用于副表撞名时换名重试。"""
+    m = re.match(r'^(.*)_(\d+)$', name)
+    if m:
+        return f'{m.group(1)}_{int(m.group(2)) + 1}'
+    return f'{name}_2'
+
+
+# ─── 本地副表名记录（按 base_token 分桶）─────────────────────
+_SUBTABLE_RECORD_PATH = Path("data/created_subtables.json")
+_subtable_record_lock = threading.Lock()
+
+
+def _load_subtable_records() -> dict:
+    """读取本地副表记录：{ base_token: [names] }"""
+    try:
+        if _SUBTABLE_RECORD_PATH.exists():
+            return json.loads(_SUBTABLE_RECORD_PATH.read_text(encoding="utf-8")) or {}
+    except Exception:
+        pass
+    return {}
+
+
+def _record_created_subtable(base_token: str, name: str):
+    """追加一条 (base_token, name) 到本地记录。"""
+    if not base_token or not name:
+        return
+    with _subtable_record_lock:
+        data = _load_subtable_records()
+        bucket = set(data.get(base_token, []))
+        if name in bucket:
+            return
+        bucket.add(name)
+        data[base_token] = sorted(bucket)
+        try:
+            _SUBTABLE_RECORD_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _SUBTABLE_RECORD_PATH.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception as e:
+            print(f"[subtable_record] 保存失败: {e}")
+
+
+def _resolve_unique_subtable_name(base_token: str, requested: str) -> str:
+    """据本地记录预先 bump 名字到未占用候选。无 base_token 则原样返回。"""
+    if not base_token or not requested:
+        return requested
+    used = set(_load_subtable_records().get(base_token, []))
+    candidate = requested
+    while candidate in used:
+        candidate = _next_subtable_candidate(candidate)
+    return candidate
+
+
+def _cdp_copy_one_subtable(page, requested_name: str, max_retries: int = 30,
+                           base_token: str = "", on_dup_found=None) -> str:
+    """fill 名字 → 等校验 → 检测"已存在"红字 → 自动递增重试 → 点确认。
+    返回实际成功使用的名字（可能与 requested 不同）。失败抛 RuntimeError。
+    前置：调用方已触发右键 → "复制数据表"，弹窗已弹出。
+    on_dup_found(name): 检测到某候选名已存在时回调（用于自我学习记录已占用名）。
+    """
+    inp = page.locator('input[placeholder="请输入数据表名称"]').first
+    inp.wait_for(timeout=8000)
+    # "复制"按钮：飞书弹窗里仅有「取消 / 复制」两个按钮，按文字精准定位
+    confirm_btn = page.get_by_role('button', name='复制').last
+    dialog = page.locator('div.semi-modal-content, div[role="dialog"]').filter(
+        has_text='复制数据表'
+    ).last
+
+    def _dup_visible() -> bool:
+        """扫页面所有"已存在"文本节点，命中可见的则判定撞名。"""
+        try:
+            for loc in page.get_by_text('已存在').all():
+                try:
+                    if loc.is_visible():
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
+    def _poll_dup(total_ms: int = 1800, step_ms: int = 200) -> bool:
+        """轮询检测撞名：红字出现或按钮禁用就立即返回 True。"""
+        waited = 0
+        while waited < total_ms:
+            if _dup_visible():
+                return True
+            try:
+                if confirm_btn.is_disabled():
+                    return True
+            except Exception:
+                pass
+            page.wait_for_timeout(step_ms)
+            waited += step_ms
+        return False
+
+    candidate = requested_name
+    print(f"[dedup] 起始候选名: {candidate}")
+    for attempt in range(max_retries):
+        # 清空 + 重新填，强制触发 React onChange 校验
+        try:
+            inp.click(timeout=3000)
+            inp.fill('')
+            page.wait_for_timeout(150)
+            inp.fill(candidate)
+        except Exception as e:
+            print(f"[dedup] fill 异常: {e}")
+            raise
+
+        # 轮询等到撞名信号或超时通过（1.8s 上限，飞书校验最慢约 1s）
+        dup_found = _poll_dup(total_ms=1800, step_ms=200)
+        print(f"[dedup] 尝试 #{attempt+1} candidate={candidate} dup={dup_found}")
+
+        if not dup_found:
+            try:
+                confirm_btn.click(timeout=5000)
+            except Exception as e:
+                print(f"[dedup] 点击复制按钮失败: {e}")
+                raise
+            # 点击后等弹窗消失；如 1.5s 后还在 → 仍是撞名兜底
+            try:
+                dialog.wait_for(state='detached', timeout=3000)
+                print(f"[dedup] ✅ 创建成功: {candidate}")
+                page.wait_for_timeout(1500)  # 等飞书侧栏刷新
+                return candidate
+            except Exception:
+                pass
+            if _dup_visible() or dialog.is_visible():
+                print(f"[dedup] click 后弹窗仍在/红字出现 → 视为撞名: {candidate}")
+                dup_found = True
+
+        if dup_found:
+            # 撞名 → 自我学习这个名字已被占用 → 换下一个候选
+            if on_dup_found:
+                try: on_dup_found(candidate)
+                except Exception as e: print(f"[dedup] on_dup_found 回调异常: {e}")
+            candidate = _next_subtable_candidate(candidate)
+            print(f"[dedup] bump → {candidate}")
+
+    raise RuntimeError(f'连续 {max_retries} 个候选名字都已存在')
+
+
+def _cdp_create_tables(entries: list, base_token: str):
+    """
+    生成器：用 Playwright CDP 逐一复制飞书副表并重命名。
+    entries: list[dict]，每个 dict 必须有 "key" 字段（要使用的副表名）。
+            撞名时函数会自动改名，并把最终名字回写到 entry["key"]，
+            供后续 Coze 调用拿到对的名字。
+    yield: (ok: bool, msg: str)
+    """
+    import platform, time
+    from playwright.sync_api import sync_playwright
+
+    feishu_url  = f"https://my.feishu.cn/base/{base_token}" if base_token else ""
+    debug_profile = str(Path.home() / ".edge-debug-profile")
+    system = platform.system()
+
+    browser = None
+    with sync_playwright() as p:
+        # 尝试连接，连不上就启动 Edge
+        for attempt in range(1, 4):
+            try:
+                browser = p.chromium.connect_over_cdp("http://localhost:9222")
+                break
+            except Exception:
+                if attempt == 1:
+                    yield (False, "🚀 Edge 未启动，正在自动启动...")
+                    try:
+                        if system == "Darwin":
+                            edge_path = "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
+                        else:
+                            edge_path = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+                        cmd = [edge_path, "--remote-debugging-port=9222",
+                               "--no-first-run", f"--user-data-dir={debug_profile}"]
+                        if feishu_url:
+                            cmd.append(feishu_url)
+                        subprocess.Popen(cmd)
+                    except Exception as e2:
+                        yield (False, f"❌ 启动 Edge 失败：{str(e2)[:100]}")
+                        return
+                wait = attempt * 4
+                yield (False, f"⏳ 等待 Edge 启动... ({wait}s)")
+                time.sleep(wait)
+
+        if browser is None:
+            yield (False, "❌ 无法连接 Edge，请手动启动后重试")
+            return
+
+        # 找飞书多维表格页面
+        page = None
+        for _ in range(10):
+            for ctx in browser.contexts:
+                for pg in ctx.pages:
+                    if "feishu.cn/base/" in pg.url:
+                        page = pg
+                        break
+                if page:
+                    break
+            if page:
+                break
+            time.sleep(2)
+
+        if not page:
+            yield (False, "❌ 未找到飞书多维表格页面，请在 Edge 中打开")
+            return
+
+        yield (True, f"✅ 已连接飞书页面：{page.url[:80]}")
+        try:
+            page.wait_for_load_state("networkidle", timeout=20000)
+        except Exception:
+            pass
+        page.wait_for_timeout(2000)
+
+        for entry in entries:
+            requested = entry['key']
+            # 预先按本地记录避让已用名（避免每次都依赖 UI 检测）
+            bumped = _resolve_unique_subtable_name(base_token, requested)
+            if bumped != requested:
+                yield (True, f"📒 本地记录显示 {requested} 已建过，预换为 {bumped}")
+            try:
+                active_tab = page.locator('.bitable-new-table-item.bitable-new-table-item__active')
+                active_tab.click(button='right')
+                copy_item = page.locator('li.b-menu__item').filter(has_text='复制数据表').first
+                copy_item.click(timeout=6000)
+                final_name = _cdp_copy_one_subtable(
+                    page, bumped,
+                    base_token=base_token,
+                    on_dup_found=lambda n: _record_created_subtable(base_token, n),
+                )
+                if final_name != requested:
+                    entry['key'] = final_name
+                    yield (True, f"⚠️ 副表 {requested} 已存在，自动改名为 {final_name}")
+                _record_created_subtable(base_token, final_name)
+                yield (True, f"✅ 副表已创建：{final_name}")
+            except Exception as e:
+                yield (False, f"❌ 副表创建失败：{requested} → {str(e)[:120]}")
+                try:
+                    page.keyboard.press('Escape')
+                    page.wait_for_timeout(500)
+                except Exception:
+                    pass
+
+
+def _cdp_create_tables_multi(buckets):
+    """
+    生成器：多 Base 串行处理。
+    buckets: [(base_token, [entries]), ...]
+            每个 entries 是 list[dict]，每个 dict 必须含 "key" 字段。
+            撞名时会自动改名并把最终名字回写到 entry["key"]。
+    yield: (ok: bool, msg: str)
+
+    工作方式：
+      1) 连接（或启动）Edge 调试浏览器
+      2) 找到或新开一个飞书 Base 标签页
+      3) 对每个 bucket：goto 到对应 Base URL → 等待加载 → 串行创建副表
+    若同账号下多个 Base：URL 自动切换即可；
+    若跨飞书账号：goto 后页面会停在登录页，会自动 yield 错误提示老板手动处理。
+    """
+    import platform, time
+    from playwright.sync_api import sync_playwright
+
+    if not buckets:
+        return
+
+    debug_profile = str(Path.home() / ".edge-debug-profile")
+    system = platform.system()
+    first_url = f"https://my.feishu.cn/base/{buckets[0][0]}" if buckets[0][0] else ""
+
+    browser = None
+    with sync_playwright() as p:
+        for attempt in range(1, 4):
+            try:
+                browser = p.chromium.connect_over_cdp("http://localhost:9222")
+                break
+            except Exception:
+                if attempt == 1:
+                    yield (False, "🚀 Edge 未启动，正在自动启动...")
+                    try:
+                        if system == "Darwin":
+                            edge_path = "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
+                        else:
+                            edge_path = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+                        cmd = [edge_path, "--remote-debugging-port=9222",
+                               "--no-first-run", f"--user-data-dir={debug_profile}"]
+                        if first_url:
+                            cmd.append(first_url)
+                        subprocess.Popen(cmd)
+                    except Exception as e2:
+                        yield (False, f"❌ 启动 Edge 失败：{str(e2)[:100]}")
+                        return
+                wait = attempt * 4
+                yield (False, f"⏳ 等待 Edge 启动... ({wait}s)")
+                time.sleep(wait)
+
+        if browser is None:
+            yield (False, "❌ 无法连接 Edge，请手动启动后重试")
+            return
+
+        # 找一个已存在的飞书 base 页面作为工作 page；若没有就新开
+        page = None
+        for ctx in browser.contexts:
+            for pg in ctx.pages:
+                if "feishu.cn/base/" in pg.url:
+                    page = pg
+                    break
+            if page:
+                break
+        if page is None:
+            # 取第一个 context（即 default）新开 tab
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = ctx.new_page()
+
+        # 依次处理每个 bucket
+        for b_idx, (base_token, entries) in enumerate(buckets, 1):
+            if not base_token or not entries:
+                yield (False, f"⏭️  桶 {b_idx} 跳过：base_token 或 entries 为空")
+                continue
+            target_url = f"https://my.feishu.cn/base/{base_token}"
+            yield (True, f"🧭 [桶 {b_idx}/{len(buckets)}] 切换到 Base：{base_token[:12]}... ({len(entries)} 个副表)")
+            try:
+                page.bring_to_front()
+                page.goto(target_url, timeout=30000, wait_until="domcontentloaded")
+            except Exception as e:
+                yield (False, f"❌ 加载 Base 页面失败：{str(e)[:120]}")
+                continue
+            try:
+                page.wait_for_load_state("networkidle", timeout=20000)
+            except Exception:
+                pass
+            page.wait_for_timeout(2500)
+
+            # 校验是否真的进了 base（跨账号场景这里会是登录页）
+            cur_url = page.url
+            if "feishu.cn/base/" not in cur_url:
+                yield (False, f"❌ 当前不在飞书 Base 页面（疑似未登录或跨账号），停在：{cur_url[:120]}")
+                yield (False, "👉 请在 Edge 中手动切换账号 / 完成登录，然后重新执行本桶")
+                continue
+
+            # 等"激活的副表"元素出现，最长 15s
+            try:
+                page.wait_for_selector('.bitable-new-table-item.bitable-new-table-item__active',
+                                       timeout=15000)
+            except Exception:
+                yield (False, f"⚠️  未找到激活的副表元素，仍继续尝试...")
+
+            yield (True, f"✅ 已就绪：{page.url[:80]}")
+
+            for entry in entries:
+                requested = entry['key']
+                # 预先按本地记录避让已用名
+                bumped = _resolve_unique_subtable_name(base_token, requested)
+                if bumped != requested:
+                    yield (True, f"📒 本地记录显示 {requested} 已建过，预换为 {bumped}")
+                try:
+                    active_tab = page.locator('.bitable-new-table-item.bitable-new-table-item__active')
+                    active_tab.click(button='right')
+                    copy_item = page.locator('li.b-menu__item').filter(has_text='复制数据表').first
+                    copy_item.click(timeout=6000)
+                    final_name = _cdp_copy_one_subtable(
+                        page, bumped,
+                        base_token=base_token,
+                        on_dup_found=lambda n, _bt=base_token: _record_created_subtable(_bt, n),
+                    )
+                    if final_name != requested:
+                        entry['key'] = final_name
+                        yield (True, f"⚠️ 副表 {requested} 已存在，自动改名为 {final_name}")
+                    _record_created_subtable(base_token, final_name)
+                    yield (True, f"✅ 副表已创建：{final_name}")
+                except Exception as e:
+                    yield (False, f"❌ 副表创建失败：{requested} → {str(e)[:120]}")
+                    try:
+                        page.keyboard.press('Escape')
+                        page.wait_for_timeout(500)
+                    except Exception:
+                        pass
+
+
+@app.route("/api/run-automation", methods=["POST"])
+def run_automation():
+    """
+    全流程自动化 SSE 接口
+    接收：multipart/form-data
+      - file        : .xlsx 文件
+      - cozeToken   : Coze 令牌
+      - workflowId  : Coze 工作流 ID
+      - baseToken   : 飞书 Base Token
+    流程：清洗 → Coze 工作流 → 飞书建副表
+    """
+    import tempfile, os, traceback, time
+
+    file        = request.files.get('file')
+    coze_token  = request.form.get('cozeToken', '').strip()
+    workflow_id = request.form.get('workflowId', '').strip()
+    base_token  = request.form.get('baseToken', DEFAULT_BASE_TOKEN).strip()
+
+    def send(msg):
+        return f"data: {json.dumps({'msg': msg}, ensure_ascii=False)}\n\n"
+
+    def generate():
+        # ── 参数校验 ──────────────────────────────────────
+        if not file or not file.filename.lower().endswith('.xlsx'):
+            yield send("❌ 请上传 .xlsx 格式的 Excel 文件")
+            yield "data: __DONE__\n\n"; return
+        if not coze_token:
+            yield send("❌ 请填写 Coze Token")
+            yield "data: __DONE__\n\n"; return
+        if not workflow_id:
+            yield send("❌ 请填写 Coze Workflow ID")
+            yield "data: __DONE__\n\n"; return
+
+        # ── Step 1: 清洗 Excel ────────────────────────────
+        yield send("📊 Step 1/3  正在清洗 Excel 数据...")
+        tmp_path = None
+        products = []   # [{key, title, json_data}]
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+                file.save(tmp.name)
+                tmp_path = tmp.name
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent))
+            from excel_parser import parse_excel
+            raw = parse_excel(tmp_path)
+            for file_key, json_data in raw.items():
+                products.append({"key": file_key, "title": json_data[0] if json_data else file_key, "data": json_data})
+            yield send(f"✅ Excel 清洗完成：共 {len(products)} 个产品")
+        except Exception as e:
+            yield send(f"❌ Excel 清洗失败：{str(e)[:200]}")
+            yield "data: __DONE__\n\n"; return
+        finally:
+            if tmp_path:
+                try: os.unlink(tmp_path)
+                except Exception: pass
+
+        if not products:
+            yield send("⚠️ 未解析到任何产品数据，请检查 Excel 格式")
+            yield "data: __DONE__\n\n"; return
+
+        # ── Step 2: 调用 Coze 工作流 ──────────────────────
+        yield send(f"🤖 Step 2/3  正在逐个触发 Coze 工作流（共 {len(products)} 个）...")
+        coze_ok, coze_fail = 0, 0
+        for p in products:
+            name     = p["key"]     # 日期_组名_产品名
+            inp_data = p["data"]    # JSON 数组
+            try:
+                result = _call_coze_sync(coze_token, workflow_id, inp_data, name)
+                code   = result.get('code', -1)
+                if code == 0:
+                    coze_ok += 1
+                    yield send(f"  ✅ 工作流已启动：{name}")
+                else:
+                    coze_fail += 1
+                    yield send(f"  ❌ 工作流失败：{name} → code={code} {result.get('msg','')[:80]}")
+            except Exception as e:
+                coze_fail += 1
+                yield send(f"  ❌ 工作流请求异常：{name} → {str(e)[:100]}")
+            time.sleep(0.5)   # 稍微限速，避免 Coze 限流
+
+        yield send(f"✅ Coze 工作流触发完毕：成功 {coze_ok} 个，失败 {coze_fail} 个")
+
+        # ── Step 3: 飞书 CDP 建副表 ───────────────────────
+        yield send(f"🗂️  Step 3/3  正在飞书多维表格创建 {len(products)} 个副表...")
+        try:
+            for ok, msg in _cdp_create_tables(products, base_token):
+                yield send(msg)
+        except Exception as e:
+            yield send(f"❌ CDP 执行异常：{str(e)[:200]}")
+
+        yield send("🎉 全流程自动化完成！")
+        yield "data: __DONE__\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
+    )
+
+
+@app.route("/api/run-coze-cdp-makeup", methods=["POST"])
+def run_coze_cdp_makeup():
+    """
+    🩹 补视频接口（SSE）：
+    接收 JSON:
+      makeups  : [{key, count, accountIndex}]
+      accounts : [{name, cozeToken, workflowId, baseToken,
+                   feishuUserToken, feishuAppId, feishuAppSecret}, ...]
+
+    流程：
+      1) 对每个 makeup 入口：读 data/input/parsed/{date}/{key}.json
+         → 用 _random_combine 重组 count 行新数据
+         → 副表名 补{date}_{group}_{product}，重名自动 _2/_3
+         → 写新 JSON 到磁盘
+         → 按 accountIndex 归桶
+      2) 复用 CDP 建副表 + Coze 并发 + 飞书台账写入
+    """
+    from excel_parser import _random_combine
+
+    body     = request.json or {}
+    makeups  = body.get("makeups", []) or []
+    accounts = body.get("accounts", []) or []
+
+    for a in accounts:
+        for k_ in list(a.keys()):
+            if isinstance(a[k_], str):
+                a[k_] = a[k_].strip()
+
+    def send(msg):
+        return f"data: {json.dumps({'msg': msg}, ensure_ascii=False)}\n\n"
+
+    def _acc_tag(i):
+        a = accounts[i] if 0 <= i < len(accounts) else {}
+        nm = (a.get("name") or "").strip()
+        return f"#{i+1}" + (f"·{nm}" if nm else "")
+
+    def _build_makeup_key(date: str, group: str, product: str) -> str:
+        """补{date}_{group}_{product}，文件已存在则 _2/_3 递增"""
+        base = f"补{date}_{group}_{product}"
+        folder = Path("data/input/parsed") / date
+        folder.mkdir(parents=True, exist_ok=True)
+        if not (folder / f"{base}.json").exists():
+            return base
+        n = 2
+        while (folder / f"{base}_{n}.json").exists():
+            n += 1
+        return f"{base}_{n}"
+
+    def generate():
+        if not makeups:
+            yield send("❌ 没有要补的产品"); yield "data: __DONE__\n\n"; return
+        if not accounts:
+            yield send("❌ 没有账号配置"); yield "data: __DONE__\n\n"; return
+        for i, a in enumerate(accounts, 1):
+            if not a.get("cozeToken"):
+                yield send(f"❌ 账号 #{i} 缺少 Coze Token"); yield "data: __DONE__\n\n"; return
+            if not a.get("workflowId"):
+                yield send(f"❌ 账号 #{i} 缺少 Workflow ID"); yield "data: __DONE__\n\n"; return
+
+        yield send(f"🩹 准备补 {len(makeups)} 个产品...")
+
+        # ── Step 0: 读磁盘 + 重组 + 写新 JSON ─────────────────────
+        products_by_acc = {i: [] for i in range(len(accounts))}
+        skipped = 0
+        for m in makeups:
+            src_key = (m.get("key") or "").strip()
+            count   = int(m.get("count") or 0)
+            acc_idx = int(m.get("accountIndex") or 0)
+            if not src_key or count < 1:
+                continue
+            if not (0 <= acc_idx < len(accounts)):
+                yield send(f"  ⚠️ {src_key}：账号下标 {acc_idx} 越界，跳过"); skipped += 1; continue
+
+            src_path = _parsed_json_path(src_key)
+            if not src_path.exists():
+                yield send(f"  ❌ {src_key}：源 JSON 不存在 {src_path}，跳过"); skipped += 1; continue
+
+            try:
+                with open(src_path, "r", encoding="utf-8") as f:
+                    src_data = json.load(f)
+            except Exception as e:
+                yield send(f"  ❌ {src_key}：读 JSON 失败 {str(e)[:120]}，跳过"); skipped += 1; continue
+            if not isinstance(src_data, list) or len(src_data) < 3:
+                yield send(f"  ❌ {src_key}：JSON 结构异常（需 [title, header, rows...]），跳过"); skipped += 1; continue
+
+            title      = src_data[0]
+            header_str = src_data[1]
+            templates  = src_data[2:]
+
+            # 解析 date / group / product（key 形如 5.16_冯会宁组_teenlab维生素d）
+            parts = src_key.split("_", 2)
+            date    = parts[0] if len(parts) > 0 else "未知"
+            group   = parts[1] if len(parts) > 1 else "默认组"
+            product = parts[2] if len(parts) > 2 else src_key
+
+            try:
+                new_rows = _random_combine(templates, header_str, count)
+            except Exception as e:
+                yield send(f"  ❌ {src_key}：重组失败 {str(e)[:150]}，跳过"); skipped += 1; continue
+            if not new_rows:
+                yield send(f"  ⚠️ {src_key}：重组返回空，跳过"); skipped += 1; continue
+
+            new_key  = _build_makeup_key(date, group, product)
+            new_data = [title, header_str] + new_rows
+            new_path = Path("data/input/parsed") / date / f"{new_key}.json"
+            try:
+                with open(new_path, "w", encoding="utf-8") as f:
+                    json.dump(new_data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                yield send(f"  ❌ {src_key}：写 {new_path.name} 失败 {str(e)[:120]}，跳过"); skipped += 1; continue
+
+            yield send(f"  ✅ {src_key} → {new_key}（{count} 条）→ 账号 {_acc_tag(acc_idx)}")
+            products_by_acc[acc_idx].append({
+                "key": new_key, "title": title, "data": new_data,
+            })
+
+        total_new = sum(len(v) for v in products_by_acc.values())
+        if total_new == 0:
+            yield send(f"❌ 没有可用的补单条目（跳过 {skipped}）"); yield "data: __DONE__\n\n"; return
+        yield send(f"📦 生成 {total_new} 个补单产品（跳过 {skipped}）")
+
+        # ── 按指定 accountIndex 分桶（不再平均分） ─────────────
+        chunks = [(idx, accounts[idx], ps) for idx, ps in products_by_acc.items() if ps]
+        for idx, acc, ps in chunks:
+            preview = ", ".join(p["key"] for p in ps[:3]) + (" ..." if len(ps) > 3 else "")
+            yield send(f"  🅰️ 账号 {_acc_tag(idx)} 分到 {len(ps)} 个补单：{preview}")
+
+        # ── Step 1: CDP 串行建副表 ─────────────────────────────
+        # 传 ps 本身（list[dict]），CDP 撞名时会就地改写 entry["key"]，Coze 步骤会自动拿到新名字
+        buckets = []
+        for idx, acc, ps in chunks:
+            bt = acc.get("baseToken", "")
+            if bt and ps:
+                buckets.append((bt, ps))
+
+        if buckets:
+            yield send(f"🗂️  Step 1/3  CDP 串行建副表（共 {len(buckets)} 个 Base）...")
+            try:
+                from playwright.sync_api import sync_playwright  # noqa
+                for ok, msg in _cdp_create_tables_multi(buckets):
+                    yield send(msg)
+            except ImportError:
+                yield send("⚠️  playwright 未安装，跳过建副表，继续调 Coze。")
+            except Exception as e:
+                yield send(f"⚠️  CDP 建副表异常（跳过，继续调 Coze）：{str(e)[:150]}")
+        else:
+            yield send("⏭️  Step 1/3  无任何账号填写 Base Token，跳过建副表")
+
+        # ── Step 2: 全局并行调 Coze ─────────────────────────────
+        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+        import sys as _sys, time as _time
+
+        def _call_one(product, account, account_idx):
+            _name     = product.get("key", "")
+            _inp_data = product.get("data", [])
+            _tag      = f"[{_acc_tag(account_idx)}]"
+            print(f"{_tag} ▶ 触发 Coze: {_name}  workflow={account.get('workflowId','')[:12]}...",
+                  file=_sys.stderr, flush=True)
+            _t0 = _time.time()
+            try:
+                _result = _call_coze_sync(account["cozeToken"], account["workflowId"],
+                                          _inp_data, _name, timeout=60)
+                _raw = _result.get('data', {})
+                if isinstance(_raw, str):
+                    try:    _raw = json.loads(_raw)
+                    except: _raw = {}
+                _debug_url  = (_raw.get('debug_url','') or _raw.get('debugUrl','')
+                               or _result.get('debug_url',''))
+                _execute_id = _raw.get('execute_id','') or _result.get('execute_id','')
+                _elapsed = _time.time() - _t0
+                return {
+                    'name': _name, 'account_idx': account_idx,
+                    'ok': _result.get('code') == 0,
+                    'debug_url': _debug_url, 'execute_id': _execute_id,
+                    'code': _result.get('code'), 'msg': _result.get('msg',''),
+                    'resp_preview': json.dumps(_result, ensure_ascii=False)[:500],
+                    'elapsed': _elapsed,
+                }
+            except Exception as _e:
+                _elapsed = _time.time() - _t0
+                return {'name': _name, 'account_idx': account_idx, 'ok': False,
+                        'debug_url': '', 'execute_id': '',
+                        'code': -1, 'msg': str(_e)[:200], 'resp_preview': '',
+                        'elapsed': _elapsed}
+
+        k_acc = len(accounts)
+        total_workers = min(total_new, max(1, k_acc) * 5)
+        yield send(f"🤖 Step 2/3  并行调用 Coze（全局并发 {total_workers}，单次超时 60s，失败不重试）...")
+
+        debug_by_account = {i: [] for i in range(k_acc)}
+        coze_ok, coze_fail = 0, 0
+
+        with ThreadPoolExecutor(max_workers=total_workers) as executor:
+            future_map = {}
+            for acc_idx, acc, ps in chunks:
+                for p in ps:
+                    fut = executor.submit(_call_one, p, acc, acc_idx)
+                    future_map[fut] = (p["key"], acc_idx)
+                    yield send(f"  📤 [{_acc_tag(acc_idx)}] 已提交：{p['key']}")
+
+            _total_n = len(future_map)
+            _done_n  = 0
+            _t_start = _time.time()
+            _pending = set(future_map.keys())
+            while _pending:
+                done, _pending = wait(_pending, timeout=5, return_when=FIRST_COMPLETED)
+                if not done:
+                    _now = _time.time()
+                    pending_names = [future_map[f][0] for f in _pending][:5]
+                    yield send(f"  ⏳ 已等待 {int(_now-_t_start)}s，剩 {len(_pending)}/{_total_n} 未返回："
+                               f"{', '.join(pending_names)}{'...' if len(_pending)>5 else ''}")
+                    continue
+                for future in done:
+                    _done_n += 1
+                    r = future.result()
+                    tag = f"[{_acc_tag(r['account_idx'])}]"
+                    yield send(f"  📥 {tag} ({_done_n}/{_total_n}) {r['name']}  耗时={r.get('elapsed',0):.1f}s  → {r['resp_preview']}")
+                    if r['ok']:
+                        coze_ok += 1
+                        debug_by_account[r['account_idx']].append({
+                            'name': r['name'], 'debug_url': r['debug_url'],
+                            'execute_id': r['execute_id']
+                        })
+                        url_hint = f"\n  🔗 {r['debug_url']}" if r['debug_url'] else "（未返回 debug_url）"
+                        yield send(f"  ✅ {tag} 工作流已接受：{r['name']}{url_hint}")
+                    else:
+                        coze_fail += 1
+                        url_hint = f"\n     🔗 debug_url: {r['debug_url']}" if r['debug_url'] else ""
+                        yield send(f"  ❌ {tag} 工作流失败：{r['name']} → code={r['code']} msg={r['msg'][:150]}{url_hint}")
+
+        yield send(f"✅ Coze 触发完毕：成功 {coze_ok} 个，失败 {coze_fail} 个")
+
+        # ── Step 3: 按账号分别写台账 ─────────────────────────
+        yield send(f"📋 Step 3/3  按账号分别写飞书台账...")
+        for acc_idx, results in debug_by_account.items():
+            acc = accounts[acc_idx]
+            tag = f"[{_acc_tag(acc_idx)}]"
+            has_token = acc.get("feishuUserToken") or (acc.get("feishuAppId") and acc.get("feishuAppSecret"))
+            if not results:
+                continue
+            if not has_token:
+                yield send(f"  ⚠️ {tag} 未填写飞书令牌，仅打印 debug_url：")
+                for r in results:
+                    yield send(f"     📌 {r['name']}  →  {r['debug_url'] or '（无）'}")
+                continue
+            auth = "App ID+Secret" if (acc.get("feishuAppId") and acc.get("feishuAppSecret")) \
+                                    else "user_access_token"
+            yield send(f"  📋 {tag} 写入 {len(results)} 条（认证：{auth}）...")
+            write_results = _write_bitable_records(
+                acc.get("feishuUserToken", ""), results,
+                app_id=acc.get("feishuAppId", ""),
+                app_secret=acc.get("feishuAppSecret", "")
+            )
+            ok_cnt   = sum(1 for ok, _ in write_results if ok)
+            fail_cnt = len(write_results) - ok_cnt
+            for ok, msg in write_results:
+                yield send(f"    {tag} {msg}")
+            yield send(f"  ✅ {tag} 台账写入完毕：成功 {ok_cnt} 批，失败 {fail_cnt} 批")
+
+        yield send("🎉 补视频全部完成！")
+        yield "data: __DONE__\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
+    )
+
+
+@app.route("/api/run-coze-cdp", methods=["POST"])
+def run_coze_cdp():
+    """
+    Stage 2 执行接口（多账号并行版）：
+    接收 JSON:
+      products : [{key, title, data: [...]}]
+      accounts : [{cozeToken, workflowId, baseToken,
+                   feishuUserToken, feishuAppId, feishuAppSecret}, ...]
+    向后兼容：未传 accounts 时，会从顶层平铺字段构造 accounts[0]。
+
+    流程：
+      平均分桶（前 N/k 给 #1，后 N/k 给 #2 …）
+      → Step 1 CDP 串行依次切换 Base 建副表
+      → Step 2 全局并发调 Coze（每桶各用自己的 Coze 凭证）
+      → Step 3 按账号分别写飞书台账
+    """
+    body     = request.json or {}
+    products = body.get("products", [])
+    accounts = body.get("accounts", []) or []
+
+    # 向后兼容：旧的平铺字段当作 accounts[0]
+    if not accounts:
+        accounts = [{
+            "cozeToken":       body.get("cozeToken", ""),
+            "workflowId":      body.get("workflowId", ""),
+            "baseToken":       body.get("baseToken", DEFAULT_BASE_TOKEN),
+            "feishuUserToken": body.get("feishuUserToken", ""),
+            "feishuAppId":     body.get("feishuAppId", ""),
+            "feishuAppSecret": body.get("feishuAppSecret", ""),
+        }]
+
+    # strip 所有字符串字段
+    for a in accounts:
+        for k_ in list(a.keys()):
+            if isinstance(a[k_], str):
+                a[k_] = a[k_].strip()
+
+    def send(msg):
+        return f"data: {json.dumps({'msg': msg}, ensure_ascii=False)}\n\n"
+
+    def generate():
+        if not products:
+            yield send("❌ 没有产品数据，请重新清洗"); yield "data: __DONE__\n\n"; return
+        for i, a in enumerate(accounts, 1):
+            if not a.get("cozeToken"):
+                yield send(f"❌ 账号 #{i} 缺少 Coze Token"); yield "data: __DONE__\n\n"; return
+            if not a.get("workflowId"):
+                yield send(f"❌ 账号 #{i} 缺少 Workflow ID"); yield "data: __DONE__\n\n"; return
+
+        k = len(accounts)
+        n = len(products)
+        yield send(f"⚙️  并行配置：{k} 个账号 × {n} 个产品，平均分桶")
+
+        # ── 自动检查并修复"台词 vs 最终台词"差异过大的行 ─────
+        fix_total = 0
+        for p in products:
+            d = p.get("data") or []
+            if len(d) < 2:
+                continue
+            try:
+                hdrs = [h.strip() for h in str(d[1]).split(" // ")]
+                rows = [[c.strip() for c in str(r).split(" // ")] for r in d[2:]]
+                # 补齐列数
+                for r in rows:
+                    while len(r) < len(hdrs): r.append("/")
+                fixed_n, details = _auto_fix_script_rows(hdrs, rows)
+                if fixed_n:
+                    fix_total += fixed_n
+                    # 回写到 product.data
+                    p["data"] = [d[0], " // ".join(hdrs)] + [" // ".join(r) for r in rows]
+                    yield send(f"  🔁 {p.get('key','?')}：{fixed_n} 行差异≥{int(SUBTITLE_DIFF_THRESHOLD*100)}%，已用最终台词覆盖台词")
+                    for det in details[:3]:
+                        yield send(f"     ↳ 行 {det['row']}  差异 {int(det['diff']*100)}%"
+                                   f"  原台词:{det['old']!r}  →  覆盖为:{det['new']!r}")
+            except Exception as _e:
+                yield send(f"  ⚠️ {p.get('key','?')}：自动覆盖台词异常（跳过）: {str(_e)[:80]}")
+        if fix_total:
+            yield send(f"✏️  共 {fix_total} 行台词被最终台词覆盖（差异阈值 {int(SUBTITLE_DIFF_THRESHOLD*100)}%）")
+        else:
+            yield send(f"✔️  台词检查通过：无行差异≥{int(SUBTITLE_DIFF_THRESHOLD*100)}%")
+
+        # ── 自动规范化视频比例（非标准 → 最近标准）─────────────
+        ratio_total = 0
+        for p in products:
+            d = p.get("data") or []
+            if len(d) < 2:
+                continue
+            try:
+                title = d[0]
+                rows  = [[c for c in str(r).split(" // ")] for r in d[2:]]
+                obj   = {"title": title, "rows": rows}
+                r_fixed, r_details = _auto_fix_ratios_product(obj)
+                if r_fixed:
+                    ratio_total += r_fixed
+                    # 回写：title 可能被改，rows 单元格可能被改
+                    p["data"] = [obj["title"], d[1]] + [" // ".join(r) for r in obj["rows"]]
+                    yield send(f"  📐 {p.get('key','?')}：规范化 {r_fixed} 处非标准比例")
+                    for det in r_details[:3]:
+                        yield send(f"     ↳ {det['where']}  {det['old']} → {det['new']}")
+            except Exception as _e:
+                yield send(f"  ⚠️ {p.get('key','?')}：比例规范化异常（跳过）: {str(_e)[:80]}")
+        if ratio_total:
+            yield send(f"📐 共规范化 {ratio_total} 处非标准比例（标准: 3:4 / 4:3 / 9:16 / 16:9）")
+        else:
+            yield send("✔️  比例检查通过：无需规范化")
+
+        # 平均分桶：前 N/k 给 #1，依次往后
+        chunks = []  # [(account_idx, account, [products])]
+        for i, acc in enumerate(accounts):
+            start = i * n // k
+            end   = (i + 1) * n // k
+            chunks.append((i, acc, products[start:end]))
+
+        for idx, acc, ps in chunks:
+            preview = ", ".join(p.get("key", "") for p in ps[:3])
+            if len(ps) > 3: preview += " ..."
+            yield send(f"  🅰️ 账号 #{idx+1}（Coze: {acc.get('cozeToken','')[:12]}...）"
+                       f"分到 {len(ps)} 个产品：{preview}")
+
+        # ── Step 1: CDP 串行建副表 ─────────────────────────────
+        # 传 ps 本身（list[dict]），CDP 撞名时会就地改写 entry["key"]，Coze 步骤会自动拿到新名字
+        buckets = []  # [(base_token, [entries])]
+        for idx, acc, ps in chunks:
+            bt = acc.get("baseToken", "")
+            if bt and ps:
+                buckets.append((bt, ps))
+
+        if buckets:
+            yield send(f"🗂️  Step 1/3  CDP 串行建副表（共 {len(buckets)} 个 Base）...")
+            try:
+                from playwright.sync_api import sync_playwright  # noqa
+                for ok, msg in _cdp_create_tables_multi(buckets):
+                    yield send(msg)
+            except ImportError:
+                yield send("⚠️  playwright 未安装，跳过建副表，继续调 Coze。"
+                           "如需建表请运行: pip3 install playwright && playwright install chromium")
+            except Exception as e:
+                yield send(f"⚠️  CDP 建副表异常（跳过，继续调 Coze）：{str(e)[:150]}")
+        else:
+            yield send("⏭️  Step 1/3  无任何账号填写 Base Token，跳过建副表")
+
+        # ── Step 2: 全局并行调 Coze（每桶各用自己的凭证） ────
+        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+        import sys as _sys, time as _time
+
+        def _call_one(product, account, account_idx):
+            _name     = product.get("key", "")
+            _inp_data = product.get("data", [])
+            _tag      = f"[#{account_idx+1}]"
+            # 服务端 stderr 也打一份，方便从终端定位卡点
+            print(f"{_tag} ▶ 触发 Coze: {_name}  workflow={account.get('workflowId','')[:12]}...",
+                  file=_sys.stderr, flush=True)
+            _t0 = _time.time()
+            try:
+                _result = _call_coze_sync(account["cozeToken"], account["workflowId"],
+                                          _inp_data, _name, timeout=60)
+                _raw    = _result.get('data', {})
+                if isinstance(_raw, str):
+                    try:    _raw = json.loads(_raw)
+                    except: _raw = {}
+                _debug_url  = (_raw.get('debug_url','') or _raw.get('debugUrl','')
+                               or _result.get('debug_url',''))
+                _execute_id = _raw.get('execute_id','') or _result.get('execute_id','')
+                _elapsed = _time.time() - _t0
+                print(f"{_tag} ◀ Coze 返回 {_name}  code={_result.get('code')}  耗时={_elapsed:.1f}s",
+                      file=_sys.stderr, flush=True)
+                return {
+                    'name': _name, 'account_idx': account_idx,
+                    'ok': _result.get('code') == 0,
+                    'debug_url': _debug_url, 'execute_id': _execute_id,
+                    'code': _result.get('code'), 'msg': _result.get('msg',''),
+                    'resp_preview': json.dumps(_result, ensure_ascii=False)[:500],
+                    'elapsed': _elapsed,
+                }
+            except Exception as _e:
+                _elapsed = _time.time() - _t0
+                print(f"{_tag} ✗ Coze 异常 {_name}  耗时={_elapsed:.1f}s  err={str(_e)[:120]}",
+                      file=_sys.stderr, flush=True)
+                return {'name': _name, 'account_idx': account_idx, 'ok': False,
+                        'debug_url': '', 'execute_id': '',
+                        'code': -1, 'msg': str(_e)[:200], 'resp_preview': '',
+                        'elapsed': _elapsed}
+
+        total_workers = min(n, k * 5)
+        yield send(f"🤖 Step 2/3  并行调用 Coze（全局并发 {total_workers}，每账号 ≈ 5 线程，单次超时 60s，失败不重试）...")
+
+        debug_by_account = {i: [] for i in range(k)}
+        coze_ok, coze_fail = 0, 0
+
+        with ThreadPoolExecutor(max_workers=total_workers) as executor:
+            future_map = {}
+            for acc_idx, acc, ps in chunks:
+                for p in ps:
+                    fut = executor.submit(_call_one, p, acc, acc_idx)
+                    future_map[fut] = (p.get("key", ""), acc_idx)
+                    yield send(f"  📤 [#{acc_idx+1}] 已提交：{p.get('key','')}")
+
+            _total_n = len(future_map)
+            _done_n  = 0
+            _t_start = _time.time()
+            _pending = set(future_map.keys())
+            while _pending:
+                # 最多等 5s，再没完成就喷一行心跳
+                done, _pending = wait(_pending, timeout=5, return_when=FIRST_COMPLETED)
+                if not done:
+                    _now = _time.time()
+                    pending_names = [future_map[f][0] for f in _pending][:5]
+                    yield send(f"  ⏳ 已等待 {int(_now-_t_start)}s，剩 {len(_pending)}/{_total_n} 未返回："
+                               f"{', '.join(pending_names)}{'...' if len(_pending)>5 else ''}")
+                    continue
+                for future in done:
+                    _done_n += 1
+                    r = future.result()
+                    tag = f"[#{r['account_idx']+1}]"
+                    yield send(f"  📥 {tag} ({_done_n}/{_total_n}) {r['name']}  耗时={r.get('elapsed',0):.1f}s  → {r['resp_preview']}")
+                    if r['ok']:
+                        coze_ok += 1
+                        debug_by_account[r['account_idx']].append({
+                            'name': r['name'], 'debug_url': r['debug_url'],
+                            'execute_id': r['execute_id']
+                        })
+                        url_hint = f"\n  🔗 {r['debug_url']}" if r['debug_url'] else "（未返回 debug_url）"
+                        yield send(f"  ✅ {tag} 工作流已接受：{r['name']}{url_hint}")
+                    else:
+                        coze_fail += 1
+                        url_hint = f"\n     🔗 debug_url: {r['debug_url']}" if r['debug_url'] else ""
+                        yield send(f"  ❌ {tag} 工作流失败：{r['name']} → code={r['code']} msg={r['msg'][:150]}{url_hint}")
+
+        yield send(f"✅ Coze 触发完毕：成功 {coze_ok} 个，失败 {coze_fail} 个")
+
+        # ── Step 3: 按账号分别写台账 ─────────────────────────
+        yield send(f"📋 Step 3/3  按账号分别写飞书台账...")
+        for acc_idx, results in debug_by_account.items():
+            acc = accounts[acc_idx]
+            tag = f"[#{acc_idx+1}]"
+            has_token = acc.get("feishuUserToken") or (acc.get("feishuAppId") and acc.get("feishuAppSecret"))
+            if not results:
+                yield send(f"  ⚠️ {tag} 无 debug_url，跳过")
+                continue
+            if not has_token:
+                yield send(f"  ⚠️ {tag} 未填写飞书令牌，仅打印 debug_url：")
+                for r in results:
+                    yield send(f"     📌 {r['name']}  →  {r['debug_url'] or '（无）'}")
+                continue
+            auth = "App ID+Secret" if (acc.get("feishuAppId") and acc.get("feishuAppSecret")) \
+                                    else "user_access_token"
+            yield send(f"  📋 {tag} 写入 {len(results)} 条（认证：{auth}）...")
+            write_results = _write_bitable_records(
+                acc.get("feishuUserToken", ""), results,
+                app_id=acc.get("feishuAppId", ""),
+                app_secret=acc.get("feishuAppSecret", "")
+            )
+            ok_cnt   = sum(1 for ok, _ in write_results if ok)
+            fail_cnt = len(write_results) - ok_cnt
+            for ok, msg in write_results:
+                yield send(f"    {tag} {msg}")
+            yield send(f"  ✅ {tag} 台账写入完毕：成功 {ok_cnt} 批，失败 {fail_cnt} 批")
+
+        yield send("🎉 全部完成！")
+        yield "data: __DONE__\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'}
+    )
+
+
+# ============================================================
+# 前端页面
+# ============================================================
+HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>秀悦视频下载工具</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #f0f2f5; color: #222; }
+  .container { max-width: 900px; margin: 30px auto; padding: 0 16px; }
+  h1 { font-size: 22px; margin-bottom: 20px; color: #1a1a2e; }
+  .card { background: #fff; border-radius: 12px; padding: 20px;
+           box-shadow: 0 2px 8px rgba(0,0,0,.08); margin-bottom: 16px; }
+  .card h2 { font-size: 14px; color: #666; margin-bottom: 12px; text-transform: uppercase; letter-spacing: .5px; }
+  label { display: block; font-size: 13px; color: #555; margin-bottom: 4px; margin-top: 10px; }
+  input, textarea { width: 100%; padding: 8px 12px; border: 1px solid #ddd;
+                    border-radius: 8px; font-size: 13px; outline: none; }
+  input:focus, textarea:focus { border-color: #4f46e5; }
+  textarea { height: 72px; resize: vertical; font-family: monospace; font-size: 12px; }
+  .row { display: flex; gap: 10px; }
+  .row input { flex: 1; }
+  button { padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer;
+           font-size: 14px; font-weight: 600; transition: opacity .2s; }
+  button:hover { opacity: .85; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  .btn-primary { background: #4f46e5; color: #fff; }
+  .btn-green   { background: #16a34a; color: #fff; }
+  .hint { font-size: 12px; color: #888; margin-top: 4px; }
+  /* 副表列表 */
+  .check-all-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .check-all-row button { padding: 5px 12px; font-size: 12px; background: #e5e7eb; color: #333; }
+  .table-scroll { max-height: 240px; overflow-y: auto; border: 1px solid #eee;
+                   border-radius: 8px; padding: 6px 10px; }
+  .table-item { display: flex; align-items: center; gap: 8px; padding: 5px 0;
+                border-bottom: 1px solid #f3f4f6; font-size: 13px; }
+  .table-item:last-child { border-bottom: none; }
+  .table-item input[type=checkbox] { width: auto; }
+  .badge { font-size: 11px; color: #6b7280; margin-left: auto; white-space: nowrap; }
+  /* 日志 */
+  #log-box { background: #1e1e2e; color: #a6e22e; border-radius: 8px;
+              padding: 14px; height: 320px; overflow-y: auto;
+              font-family: "Menlo", monospace; font-size: 12px; line-height: 1.7;
+              white-space: pre-wrap; display: none; }
+  .progress-bar-wrap { background: #e5e7eb; border-radius: 99px; height: 8px; margin: 10px 0; display: none; }
+  .progress-bar { height: 100%; border-radius: 99px; background: #16a34a;
+                   transition: width .3s; width: 0%; }
+  #status { font-size: 13px; color: #555; min-height: 20px; }
+  /* Excel 清洗结果样式 */
+  .product-card { border:1px solid #e5e7eb; border-radius:10px; margin-bottom:12px; overflow:hidden; }
+  .product-card-header { background:#f5f3ff; padding:10px 14px; display:flex; align-items:center; gap:10px;
+                          cursor:pointer; user-select:none; }
+  .product-card-header:hover { background:#ede9fe; }
+  .product-title { font-size:13px; font-weight:600; color:#3730a3; flex:1; }
+  .product-badge { background:#7c3aed; color:#fff; font-size:11px; padding:2px 8px; border-radius:99px; white-space:nowrap; }
+  .product-table-wrap { overflow-x:auto; max-height:240px; overflow-y:auto; }
+  .product-table { width:100%; border-collapse:collapse; font-size:12px; }
+  .product-table th { background:#ede9fe; color:#4c1d95; padding:6px 10px; text-align:left;
+                       white-space:nowrap; position:sticky; top:0; z-index:1; }
+  .product-table td { padding:5px 10px; border-bottom:1px solid #f3f4f6; color:#374151;
+                       max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .product-table tr:last-child td { border-bottom:none; }
+  .product-table tr:hover td { background:#faf5ff; }
+  .product-toggle { color:#7c3aed; font-size:14px; transition:transform .2s; }
+  .product-toggle.collapsed { transform:rotate(-90deg); }
+  /* 可编辑单元格 */
+  .product-table th[contenteditable], .product-table td[contenteditable] {
+    cursor:text; white-space:pre-wrap; word-break:break-all; max-width:280px; }
+  .product-table th[contenteditable]:focus, .product-table td[contenteditable]:focus {
+    outline:2px solid #7c3aed; outline-offset:-2px; background:#fff; }
+  .product-table td.cell-saving { background:#fef3c7 !important; }
+  .product-table td.cell-saved  { background:#d1fae5 !important; transition:background .8s; }
+  .product-table td.cell-error  { background:#fee2e2 !important; }
+  /* 行操作列：拖拽手柄 + 删除按钮 */
+  .product-table th.row-ops, .product-table td.row-ops {
+    width:54px; min-width:54px; text-align:center; color:#9ca3af; padding:4px 2px;
+    background:#faf5ff; position:sticky; left:0; z-index:2; }
+  .product-table th.row-ops { background:#ede9fe; }
+  .row-drag  { cursor:grab; user-select:none; font-size:14px; color:#a78bfa; padding:0 3px; }
+  .row-drag:active { cursor:grabbing; }
+  .row-del   { cursor:pointer; color:#ef4444; padding:0 3px; font-size:13px; background:none; border:none; }
+  .row-del:hover { color:#b91c1c; }
+  .product-table tr.dragging { opacity:.35; }
+  .product-table tr.drag-over td { border-top:2px solid #7c3aed; }
+  /* 表底新增按钮 */
+  .row-add-bar { padding:6px 12px; background:#f5f3ff; border-top:1px solid #ede9fe;
+                 display:flex; gap:8px; align-items:center; }
+  .row-add-bar button { padding:4px 12px; font-size:12px; background:#7c3aed; color:#fff;
+                        border-radius:6px; font-weight:500; }
+  /* 可编辑标题 */
+  .product-title[contenteditable]:focus { outline:2px solid #fff; outline-offset:-2px;
+    background:rgba(255,255,255,.6); border-radius:4px; padding:0 4px; }
+  /* 保存状态提示（卡片头部右上角） */
+  .save-hint { font-size:11px; color:#9ca3af; margin-right:8px; }
+  .save-hint.saving { color:#d97706; }
+  .save-hint.saved  { color:#059669; }
+  .save-hint.error  { color:#dc2626; }
+  /* 项目/组 分层样式 */
+  .project-block { margin-bottom:14px; border-radius:10px; border:1px solid #ddd6fe; overflow:hidden; }
+  .project-header { display:flex; align-items:center; gap:10px; padding:10px 14px;
+                    background:linear-gradient(135deg,#7c3aed,#6d28d9); color:#fff; cursor:pointer;
+                    user-select:none; }
+  .project-header:hover { opacity:.92; }
+  .project-name { font-size:14px; font-weight:700; flex:1; }
+  .project-stats { font-size:12px; opacity:.85; white-space:nowrap; }
+  .project-toggle { font-size:13px; transition:transform .2s; }
+  .project-toggle.collapsed { transform:rotate(-90deg); }
+  .group-section { }
+  .group-header { display:flex; align-items:center; gap:8px; padding:7px 14px;
+                  background:#ede9fe; color:#5b21b6; font-size:12px; font-weight:700;
+                  border-top:1px solid #ddd6fe; }
+  .project-body { }
+  /* 🔍 未建副表高亮 */
+  .product-card.missing-subtable { border:2px solid #ef4444; box-shadow:0 0 0 3px rgba(239,68,68,.15); }
+  .product-card.missing-subtable .product-card-header { background:#fef2f2; }
+  .product-card.missing-subtable .product-card-header::before {
+    content:'❌ 未建副表'; background:#dc2626; color:#fff; font-size:11px; font-weight:700;
+    padding:2px 8px; border-radius:99px; margin-right:8px;
+  }
+  /* 检查结果模态框 */
+  .check-modal-mask { position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:9999;
+                      display:none; align-items:center; justify-content:center; }
+  .check-modal-mask.show { display:flex; }
+  .check-modal { background:#fff; border-radius:12px; width:min(680px,92vw); max-height:80vh;
+                 display:flex; flex-direction:column; box-shadow:0 20px 50px rgba(0,0,0,.3); }
+  .check-modal-head { padding:14px 18px; border-bottom:1px solid #e5e7eb; display:flex;
+                      align-items:center; gap:10px; }
+  .check-modal-body { padding:14px 18px; overflow:auto; flex:1; font-size:13px; line-height:1.6; }
+  .check-modal-foot { padding:12px 18px; border-top:1px solid #e5e7eb; display:flex; gap:8px;
+                      justify-content:flex-end; }
+  .check-modal-btn { padding:8px 16px; border-radius:6px; border:none; cursor:pointer;
+                     font-size:13px; font-weight:600; }
+  /* ── 顶部 Tab 切换（钉钉同步 / Excel 离线） ── */
+  .mode-tabs { display:flex; gap:6px; margin-bottom:12px; border-bottom:2px solid #e5e7eb; }
+  .mode-tab  { padding:8px 18px; border:none; background:transparent; cursor:pointer;
+               font-size:13px; font-weight:700; color:#6b7280; border-radius:8px 8px 0 0;
+               border-bottom:3px solid transparent; margin-bottom:-2px; transition:all .15s; }
+  .mode-tab:hover { color:#7c3aed; background:#faf5ff; }
+  .mode-tab.active { color:#7c3aed; border-bottom-color:#7c3aed; background:#faf5ff; }
+  .mode-panel { display:none; }
+  .mode-panel.active { display:block; }
+  /* 钉钉同步工具栏 */
+  .dt-toolbar { display:flex; align-items:center; gap:10px; padding:10px 14px;
+                background:#ecfdf5; border:1px solid #6ee7b7; border-radius:10px;
+                margin-bottom:12px; flex-wrap:wrap; }
+  .dt-status { font-size:12px; font-weight:700; padding:3px 10px; border-radius:99px;
+               white-space:nowrap; }
+  .dt-status.ok   { background:#d1fae5; color:#065f46; }
+  .dt-status.no   { background:#fee2e2; color:#991b1b; }
+  .dt-status.wait { background:#fef3c7; color:#92400e; }
+  .dt-btn { padding:6px 14px; border-radius:6px; border:none; cursor:pointer;
+            font-size:12px; font-weight:600; white-space:nowrap; }
+  .dt-btn.primary { background:#10b981; color:#fff; }
+  .dt-btn.primary:hover { background:#059669; }
+  .dt-btn.ghost   { background:#fff; color:#065f46; border:1px solid #6ee7b7; }
+  .dt-btn.ghost:hover { background:#ecfdf5; }
+  .dt-btn:disabled { opacity:.55; cursor:not-allowed; }
+  .dt-date-input { width:90px; padding:5px 8px; border:1px solid #6ee7b7;
+                   border-radius:6px; font-size:12px; text-align:center;
+                   background:#fff; color:#065f46; font-weight:600; }
+  /* ── 扁平产品卡（钉钉 Tab） ── */
+  .dt-sheet-group { margin-bottom:14px; }
+  .dt-sheet-header { display:flex; align-items:center; gap:8px; padding:7px 12px;
+                     background:linear-gradient(135deg,#10b981,#059669); color:#fff;
+                     border-radius:8px 8px 0 0; font-size:13px; font-weight:700;
+                     border:1px solid #059669; border-bottom:none; }
+  .dt-sheet-body  { border:1px solid #bbf7d0; border-top:none; border-radius:0 0 8px 8px;
+                    background:#fff; padding:8px; display:flex; flex-direction:column; gap:6px; }
+  .dt-card { border:1px solid #e5e7eb; border-radius:8px; background:#fff;
+             padding:8px 10px; display:flex; flex-direction:column; gap:6px;
+             transition:border-color .15s; }
+  .dt-card:hover { border-color:#10b981; }
+  .dt-card.selected { border-color:#10b981; background:#f0fdf4; }
+  .dt-card-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .dt-card-name { font-size:13px; font-weight:700; color:#111827; flex:1; min-width:140px; }
+  .dt-card-meta { font-size:11px; color:#6b7280; white-space:nowrap; }
+  .dt-card-meta b { color:#10b981; }
+  .dt-task-rows { display:flex; flex-direction:column; gap:4px; padding-left:24px; }
+  .dt-task-row  { display:flex; align-items:center; gap:6px; font-size:12px; }
+  .dt-task-row select, .dt-task-row input {
+    padding:3px 6px; border:1px solid #d1d5db; border-radius:5px; font-size:12px; }
+  .dt-task-row select { min-width:80px; background:#fff; color:#374151; }
+  .dt-task-row input.dt-count {
+    width:55px; text-align:center; background:#fffbeb; border-color:#fcd34d;
+    color:#92400e; font-weight:700; }
+  .dt-task-row .dt-mode-tag {
+    font-size:10px; padding:1px 6px; border-radius:99px; font-weight:700;
+    background:#ede9fe; color:#5b21b6; white-space:nowrap; }
+  .dt-task-row .dt-mode-tag.m2 { background:#fef3c7; color:#92400e; }
+  .dt-task-row .dt-mode-tag.unknown { background:#f3f4f6; color:#9ca3af; }
+  .dt-task-row .dt-row-del {
+    background:none; border:none; color:#ef4444; cursor:pointer; font-size:14px;
+    padding:0 4px; line-height:1; }
+  .dt-task-row .dt-row-del:hover { color:#b91c1c; }
+  .dt-task-add {
+    align-self:flex-start; padding:2px 10px; font-size:11px;
+    background:#ecfdf5; color:#065f46; border:1px dashed #6ee7b7; border-radius:5px;
+    cursor:pointer; font-weight:600; margin-left:24px; }
+  .dt-task-add:hover { background:#d1fae5; }
+  .dt-bulk-bar { display:flex; align-items:center; gap:10px; padding:8px 12px;
+                 background:#ecfdf5; border:1px solid #6ee7b7; border-radius:8px;
+                 margin-bottom:10px; flex-wrap:wrap; }
+  .dt-bulk-bar label { display:flex; align-items:center; gap:5px; font-size:12px;
+                       color:#065f46; font-weight:600; cursor:pointer; margin:0; }
+  .dt-bulk-bar .dt-sel-count { font-size:11px; color:#10b981; flex:1; }
+  /* ── 右侧固定操作栏 ── */
+  .side-bar { position:fixed; right:0; top:50%; transform:translateY(-50%);
+              z-index:9000; display:flex; flex-direction:column;
+              border-radius:12px 0 0 12px; overflow:hidden;
+              box-shadow:-3px 0 16px rgba(0,0,0,.18); }
+  .side-btn { width:54px; padding:14px 0; border:none; cursor:pointer;
+              display:flex; flex-direction:column; align-items:center; justify-content:center;
+              gap:5px; font-size:11px; font-weight:700; color:#fff;
+              transition:filter .15s; }
+  .side-btn:hover:not(:disabled) { filter:brightness(1.12); }
+  .side-btn:active:not(:disabled) { filter:brightness(.92); }
+  .side-btn:disabled { opacity:.38; cursor:not-allowed; }
+  .side-btn .sb-icon { font-size:19px; line-height:1; }
+  .side-btn.sb-preview  { background:#10b981; }
+  .side-btn.sb-download { background:#f59e0b; }
+  .side-bar-sep { height:1px; background:rgba(255,255,255,.35); }
+  /* ── 预览模态框 ── */
+  .dt-modal-mask { position:fixed; inset:0; background:rgba(15,23,42,.52);
+                   z-index:9500; display:flex; align-items:center; justify-content:center;
+                   padding:24px; box-sizing:border-box; }
+  .dt-modal-box  { background:#fff; border-radius:16px; width:min(960px,100%);
+                   max-height:calc(100vh - 48px); display:flex; flex-direction:column;
+                   overflow:hidden; box-shadow:0 24px 64px rgba(0,0,0,.28); }
+  .dt-modal-head { display:flex; align-items:center; gap:12px; padding:16px 20px;
+                   border-bottom:1px solid #e5e7eb; flex-shrink:0; background:#fff;
+                   border-radius:16px 16px 0 0; }
+  .dt-modal-head .dm-title { flex:1; }
+  .dt-modal-head .dm-title h3 { margin:0; font-size:15px; font-weight:700; color:#1f2937; }
+  .dt-modal-head .dm-title p  { margin:3px 0 0; font-size:12px; color:#6b7280; }
+  .dt-modal-exec { padding:9px 22px; font-size:13px; font-weight:600; border:none;
+                   border-radius:8px; cursor:pointer; color:#fff;
+                   background:linear-gradient(135deg,#10b981,#059669);
+                   transition:opacity .15s; }
+  .dt-modal-exec:hover:not(:disabled) { opacity:.88; }
+  .dt-modal-exec:disabled { opacity:.4; cursor:not-allowed; }
+  .dt-modal-close { width:36px; height:36px; border-radius:8px; border:1px solid #e5e7eb;
+                    background:#f9fafb; cursor:pointer; font-size:18px; color:#6b7280;
+                    display:flex; align-items:center; justify-content:center; transition:background .15s; }
+  .dt-modal-close:hover { background:#f3f4f6; color:#374151; }
+  .dt-modal-warn { display:none; flex-shrink:0; padding:8px 20px; font-size:12px;
+                   color:#b91c1c; background:#fef2f2; border-bottom:1px solid #fecaca; }
+  .dt-modal-body { flex:1; overflow:auto; background:#fafafa; }
+</style>
+</head>
+<body>
+<!-- 右侧固定操作栏 -->
+<div class="side-bar">
+  <button class="side-btn sb-preview" id="side-preview" onclick="sideAction('preview')">
+    <span class="sb-icon">📋</span><span>预览</span>
+  </button>
+  <div class="side-bar-sep"></div>
+  <button class="side-btn sb-download" id="side-download" onclick="sideAction('download')">
+    <span class="sb-icon">⬇</span><span>下载</span>
+  </button>
+</div>
+
+<!-- 📋 预览模态框（点击"展开预览"后弹出） -->
+<div id="dt-preview-modal" class="dt-modal-mask" style="display:none"
+     onclick="if(event.target===this) dtCancelPreview()">
+  <div class="dt-modal-box">
+    <!-- 固定头部：标题 + 开始执行 + 关闭 -->
+    <div class="dt-modal-head">
+      <div class="dm-title">
+        <h3>📋 副表预览</h3>
+        <p id="dt-preview-summary">正在加载...</p>
+      </div>
+      <button id="dt-btn-confirm" class="dt-modal-exec" onclick="dtConfirmExecute()">
+        ⚡ 开始执行
+      </button>
+      <button class="dt-modal-close" onclick="dtCancelPreview()" title="关闭">✕</button>
+    </div>
+    <!-- 警告区（固定，不随内容滚动） -->
+    <div id="dt-preview-warnings" class="dt-modal-warn"></div>
+    <!-- 可滚动的副表列表 -->
+    <div id="dt-preview-list" class="dt-modal-body"></div>
+  </div>
+</div>
+
+<!-- 🔍 副表检查结果模态框 -->
+<div id="check-modal-mask" class="check-modal-mask" onclick="if(event.target===this) closeCheckModal()">
+  <div class="check-modal">
+    <div class="check-modal-head">
+      <span style="font-size:16px;font-weight:700;color:#1f2937;flex:1">🔍 副表检查结果</span>
+      <button onclick="closeCheckModal()" class="check-modal-btn" style="background:#f3f4f6;color:#374151">✕</button>
+    </div>
+    <div id="check-modal-body" class="check-modal-body"></div>
+    <div class="check-modal-foot">
+      <button id="btn-highlight-missing" onclick="highlightMissingProducts()" class="check-modal-btn"
+              style="background:#dc2626;color:#fff">📌 高亮未建产品</button>
+      <button id="btn-copy-missing" onclick="copyMissingList()" class="check-modal-btn"
+              style="background:#7c3aed;color:#fff">📋 复制清单</button>
+      <button onclick="closeCheckModal()" class="check-modal-btn"
+              style="background:#e5e7eb;color:#374151">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div class="container">
+  <h1>🎬 秀悦自动视频平台</h1>
+
+  <!-- 全流程自动化 -->
+  <div class="card" style="border:2px solid #7c3aed;background:linear-gradient(135deg,#faf5ff 0%,#fff 60%)">
+    <h2 style="color:#6d28d9">⚡ 全流程自动化（清洗预览 → 确认 → Coze + 飞书建表）</h2>
+
+    <!-- ── 账号卡片（支持多账号并行）── -->
+    <div style="margin-bottom:14px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;gap:8px">
+        <div style="font-size:13px;color:#6d28d9;font-weight:700;flex:1">
+          🔑 账号配置（每张卡 = 一组 Coze + 飞书，多账号并行执行）
+        </div>
+        <button onclick="_toggleAllAccountCards(true)" title="一键展开所有账号卡"
+                style="padding:5px 10px;background:#ede9fe;color:#6d28d9;border:1px solid #ddd6fe;
+                       border-radius:6px;cursor:pointer;font-size:12px">
+          ▼ 全部展开
+        </button>
+        <button onclick="_toggleAllAccountCards(false)" title="一键收起所有账号卡"
+                style="padding:5px 10px;background:#ede9fe;color:#6d28d9;border:1px solid #ddd6fe;
+                       border-radius:6px;cursor:pointer;font-size:12px">
+          ▶ 全部收起
+        </button>
+        <button onclick="addAccountCard()" style="padding:6px 12px;background:#7c3aed;color:white;
+                border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600">
+          ➕ 添加账号
+        </button>
+      </div>
+      <div id="auto-accounts-list"></div>
+    </div>
+
+    <!-- ── 顶部 Tab 切换：钉钉同步 / Excel 离线 ── -->
+    <div class="mode-tabs">
+      <button class="mode-tab active" data-mode="dingtalk" onclick="switchMode('dingtalk')">📥 钉钉同步</button>
+      <button class="mode-tab" data-mode="excel" onclick="switchMode('excel')">📊 Excel 离线（兜底）</button>
+    </div>
+
+    <!-- ── 钉钉同步面板 ── -->
+    <div id="mode-dingtalk" class="mode-panel active">
+      <div class="dt-toolbar">
+        <span id="dt-status" class="dt-status wait" title="钉钉登录状态">⚪ 检查中…</span>
+        <button id="dt-btn-login" class="dt-btn primary" onclick="dtLogin()">🔑 钉钉登录</button>
+        <button id="dt-btn-logout" class="dt-btn ghost" onclick="dtLogout()" style="display:none">↩ 登出</button>
+        <span style="flex:1"></span>
+        <span style="font-size:12px;color:#065f46;font-weight:700">📅 默认日期</span>
+        <input type="text" id="dt-default-date" class="dt-date-input" placeholder="5.22"
+               oninput="_persistDtDefaultDate(this.value)" title="新增任务行时默认填这一天（格式 月.日）">
+        <button id="dt-btn-sync" class="dt-btn primary" onclick="dtSync()" disabled>📥 同步钉钉数据</button>
+      </div>
+      <div id="dt-summary" style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;
+           padding:10px 14px;font-size:12px;color:#166534;margin-bottom:10px;display:none"></div>
+      <div id="dt-bulk-bar" class="dt-bulk-bar" style="display:none">
+        <label>
+          <input type="checkbox" id="dt-chk-all" onclick="dtToggleSelectAll(); return false;"
+                 style="width:auto;accent-color:#10b981">
+          全选
+        </label>
+        <span id="dt-sel-count" class="dt-sel-count">尚未选中任何产品</span>
+        <button onclick="dtAutoFill('all')"
+                style="padding:3px 10px;font-size:11px;background:#d1fae5;color:#065f46;
+                       border:1px solid #6ee7b7;border-radius:6px;cursor:pointer;font-weight:600">
+          ✨ 自动填入
+        </button>
+        <button onclick="dtClearFill('all')"
+                style="padding:3px 10px;font-size:11px;background:#fee2e2;color:#991b1b;
+                       border:1px solid #fca5a5;border-radius:6px;cursor:pointer;font-weight:600">
+          🗑 清除
+        </button>
+        <span style="font-size:11px;color:#065f46">📅 工具栏默认日期 = 新任务行的初始日期</span>
+      </div>
+      <div id="dt-product-list" style="font-size:13px;color:#6b7280;padding:30px;text-align:center;
+           background:#f9fafb;border:1px dashed #d1d5db;border-radius:10px">
+        请先登录钉钉，再点「📥 同步钉钉数据」拉取产品列表
+      </div>
+      <div id="dt-actions" style="display:none;margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button id="dt-btn-exec" class="dt-btn primary" style="background:linear-gradient(135deg,#10b981,#059669);
+                padding:12px 32px;font-size:14px" onclick="dtPreview()">
+          📋 展开预览
+        </button>
+        <span id="dt-task-summary" style="font-size:12px;color:#065f46;font-weight:600"></span>
+      </div>
+
+      <!-- 预览区：展开后的副表列表 + 二次确认按钮 -->
+
+      <!-- 执行日志区：复用 SSE 流 -->
+      <div id="dt-log-wrap" style="display:none;margin-top:14px;background:#0f172a;border-radius:10px;padding:12px 14px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+          <strong style="color:#a78bfa;font-size:13px">📜 执行日志</strong>
+          <button class="dt-btn ghost" onclick="dtCopyLog()" style="font-size:11px">📋 复制</button>
+        </div>
+        <div id="dt-log" style="font-family:Menlo,monospace;font-size:12px;color:#e5e7eb;max-height:360px;
+             overflow:auto;white-space:pre-wrap;line-height:1.5"></div>
+      </div>
+    </div>
+
+    <!-- ── Excel 离线面板（原有 Stage 1/2/3 包裹） ── -->
+    <div id="mode-excel" class="mode-panel">
+
+    <!-- ── Stage 1：上传 + 清洗预览 ── -->
+    <div id="auto-s1">
+      <div class="hint" style="margin-bottom:14px;color:#7c3aed">
+        💡 填批次日期 → 上传 Excel → 点「清洗预览」→ 给每个产品填条数 → 点「确认执行」
+      </div>
+      <!-- 批次日期输入 -->
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;padding:10px 14px;
+                  background:#fef3c7;border:1px solid #fcd34d;border-radius:8px">
+        <span style="font-size:13px;color:#92400e;font-weight:700">📅 批次日期</span>
+        <input type="text" id="auto-batch-date" placeholder="例：5.21."
+               oninput="_persistBatchDate(this.value)"
+               style="flex:1;max-width:200px;padding:6px 10px;border:1px solid #fcd34d;
+                      border-radius:6px;font-size:13px;background:#fff">
+        <span style="font-size:11px;color:#b45309;flex:1">
+          ⚠ 本次上传 Excel 里所有产品都会归到该日期下，请按甲方文档命名填写
+        </span>
+      </div>
+      <!-- 文件上传区 -->
+      <div id="auto-drop-zone" onclick="document.getElementById('auto-file-input').click()"
+           style="border:2px dashed #c4b5fd;border-radius:10px;padding:18px;text-align:center;cursor:pointer;
+                  background:#f5f3ff;transition:background .2s"
+           ondragover="event.preventDefault();this.style.background='#ede9fe'"
+           ondragleave="this.style.background='#f5f3ff'"
+           ondrop="handleAutoDrop(event)">
+        <div style="font-size:24px">📂</div>
+        <div style="font-size:13px;color:#6d28d9;margin-top:4px;font-weight:600">点击选择 或 拖拽 甲方 Excel（.xlsx）</div>
+        <input type="file" id="auto-file-input" accept=".xlsx" style="display:none" onchange="handleAutoFile(this.files[0])">
+      </div>
+      <div id="auto-file-name" style="font-size:12px;color:#6d28d9;margin-top:6px;display:none"></div>
+      <div style="margin-top:12px">
+        <button id="btn-auto-clean" onclick="autoCleanPreview()"
+                style="background:#7c3aed;color:#fff;border:none;padding:10px 28px;
+                       border-radius:8px;cursor:pointer;font-size:14px;font-weight:600">
+          📊 清洗并预览
+        </button>
+      </div>
+    </div>
+
+    <!-- ── Stage 2：预览结果 + 人工确认 ── -->
+    <div id="auto-s2" style="display:none">
+      <hr style="margin:14px 0;border:none;border-top:1px solid #e9d5ff">
+      <div id="auto-preview-summary" style="background:#f5f3ff;border-radius:8px;padding:10px 14px;
+           font-size:13px;color:#5b21b6;font-weight:600;margin-bottom:10px"></div>
+
+      <!-- 全选工具栏 -->
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px;padding:8px 12px;
+                  background:#ede9fe;border-radius:8px;border:1px solid #c4b5fd">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:#6d28d9;
+                       font-weight:600;cursor:pointer;margin:0">
+          <input type="checkbox" id="chk-all-auto" onchange="toggleSelectAll(this.checked)"
+                 style="width:auto;cursor:pointer;accent-color:#7c3aed">
+          全选
+        </label>
+        <span id="auto-select-count" style="font-size:12px;color:#7c3aed;flex:1"></span>
+        <button onclick="deleteSelected()"
+                style="background:#fee2e2;color:#dc2626;border:1px solid #fca5a5;padding:5px 12px;
+                       border-radius:6px;cursor:pointer;font-size:12px;font-weight:600">
+          🗑 删除所选
+        </button>
+      </div>
+
+      <div id="auto-preview-list"></div>
+      <div style="margin-top:14px;padding:12px;background:#fefce8;border-radius:8px;border:1px solid #fde047;
+           font-size:13px;color:#713f12">
+        ⚠️ 勾选需要执行的产品，确认后将触发 Coze 工作流并自动在飞书创建对应副表
+      </div>
+      <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+        <button id="btn-auto-exec" onclick="autoExecute()"
+                style="background:linear-gradient(135deg,#7c3aed,#4f46e5);color:#fff;border:none;
+                       padding:12px 32px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:700;
+                       box-shadow:0 4px 12px rgba(124,58,237,.3)">
+          ⚡ 确认，开始执行
+        </button>
+        <button id="btn-auto-makeup" onclick="autoMakeup()"
+                title="只对填了"补?"数量的产品生效；副表名前自动加"补"前缀，重名自动 _2/_3"
+                style="background:linear-gradient(135deg,#f59e0b,#ea580c);color:#fff;border:none;
+                       padding:12px 22px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:700;
+                       box-shadow:0 4px 12px rgba(245,158,11,.3)">
+          🩹 批量补视频
+        </button>
+        <button id="btn-check-subtables" onclick="checkMissingSubtables()"
+                title="对比飞书 Base 里已建副表，找出当前产品列表里还没建副表的产品"
+                style="background:#fef9c3;color:#854d0e;border:1px solid #fde047;
+                       padding:12px 18px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600">
+          🔍 检查未建副表
+        </button>
+        <!-- 追加上传：日期输入框 + 按钮成对出现，避免在 Stage 2 找不到 Stage 1 的批次框 -->
+        <span style="display:inline-flex;align-items:center;gap:6px;padding:6px 10px;
+                     background:#fef3c7;border:1px solid #fcd34d;border-radius:8px">
+          <span style="font-size:12px;color:#92400e;font-weight:700">📅 追加批次</span>
+          <input type="text" id="auto-batch-date-append" placeholder="例：5.21."
+                 style="width:110px;padding:5px 8px;border:1px solid #fcd34d;
+                        border-radius:6px;font-size:12px;background:#fff">
+        </span>
+        <button onclick="triggerAppendUpload()"
+                title="不清空已有数据，再上传一份 Excel 追加到列表（同 key 的产品会被新数据覆盖）"
+                style="background:#dcfce7;color:#15803d;border:1px solid #86efac;
+                       padding:12px 18px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600">
+          ➕ 追加上传
+        </button>
+        <input type="file" id="auto-append-input" accept=".xlsx" style="display:none"
+               onchange="handleAppendFile(this.files[0])">
+        <button onclick="resetAutoStage()"
+                title="清空当前所有清洗结果，回到上传页"
+                style="background:#e5e7eb;color:#555;border:none;padding:12px 18px;border-radius:8px;cursor:pointer;font-size:13px">
+          ↩ 重新上传（清空全部）
+        </button>
+      </div>
+    </div>
+
+    <!-- ── Stage 3：执行日志 ── -->
+    <div id="auto-log-wrap" style="display:none;margin-top:14px">
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-bottom:6px">
+        <button onclick="copyAutoLog()" style="padding:4px 10px;background:#475569;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px">📋 复制全部日志</button>
+        <button onclick="document.getElementById('auto-log').innerHTML=''" style="padding:4px 10px;background:#64748b;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px">🧹 清空</button>
+      </div>
+      <div id="auto-log" style="background:#1a1a2e;color:#e0e0e0;
+           padding:12px 16px;border-radius:10px;font-size:12px;font-family:monospace;
+           max-height:380px;overflow-y:auto;line-height:1.9;user-select:text;-webkit-user-select:text"></div>
+    </div>
+
+    </div><!-- /#mode-excel -->
+  </div>
+
+  <!-- 下载板块 -->
+  <div class="card">
+    <h2>⬇️ 视频下载</h2>
+    <!-- 配置区 -->
+    <label>飞书 Cookie
+      <span style="float:right;font-size:11px;color:#4f46e5;cursor:pointer" onclick="showHelp()">❓ 如何获取</span>
+    </label>
+    <textarea id="cookie" placeholder="从 Chrome DevTools → Network → 任意请求 → Request Headers → cookie 复制粘贴" oninput="autoSaveConfig()"></textarea>
+    <div class="row" style="margin-top:10px">
+      <div style="flex:1">
+        <label>视频字段 ID（默认，所有 Base 共用，可在每张 Base 卡片内单独覆盖）</label>
+        <input id="fieldId" value="fldksNMEZ4" oninput="autoSaveConfig()">
+      </div>
+    </div>
+    <label>本地保存目录</label>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input id="outputDir" value="{{ output_dir }}" style="flex:1">
+      <button onclick="pickFolder()" style="padding:8px 14px;background:#6366f1;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:13px;white-space:nowrap">📂 选择文件夹</button>
+    </div>
+    <div class="hint">📁 视频将按「组名 / 日期_产品名」两层文件夹分类存放，文件名格式：日期_产品名_序号.mp4</div>
+
+    <!-- 下载策略选项 -->
+    <div style="margin-top:12px;padding:10px 12px;background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;font-size:13px">
+      <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap">
+        <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;white-space:nowrap">
+          <input type="checkbox" id="forceRedownload" onchange="autoSaveConfig()" style="width:auto;flex:none;margin:0">
+          <span>🔄 强制重新下载（覆盖本地已存在文件）</span>
+        </label>
+        <span style="color:#cbd5e1">|</span>
+        <label style="display:inline-flex;align-items:center;gap:6px;white-space:nowrap">
+          <span>残缺文件阈值</span>
+          <input id="minSizeKb" type="number" value="50" min="0" step="10" style="width:70px;flex:none;padding:4px 6px;font-size:12px" oninput="autoSaveConfig()">
+          <span style="color:#666">KB（小于此值视为下载残缺，自动重下）</span>
+        </label>
+      </div>
+      <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-top:8px">
+        <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;white-space:nowrap">
+          <input type="checkbox" id="makeZip" checked onchange="autoSaveConfig()" style="width:auto;flex:none;margin:0">
+          <span>📦 下完自动打包成 zip（每个副表一个压缩包，放在组文件夹下）</span>
+        </label>
+        <span style="color:#cbd5e1">|</span>
+        <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;white-space:nowrap">
+          <input type="checkbox" id="deleteAfterZip" onchange="autoSaveConfig()" style="width:auto;flex:none;margin:0">
+          <span>🗑 打包成功后删除原文件夹（省空间，但失去断点续传）</span>
+        </label>
+      </div>
+    </div>
+
+    <!-- 多 Base 卡片区 -->
+    <div style="margin-top:18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <h3 style="margin:0;font-size:15px">📚 下载 Base 列表</h3>
+      <button class="btn-primary" id="btn-fetch-multi" onclick="fetchAllDlTables()">🔗 一键拉取全部副表</button>
+      <button onclick="addDlBase()" style="margin-left:auto;padding:6px 14px;background:#10b981;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px">➕ 添加 Base</button>
+    </div>
+    <div id="dl-bases-container" style="margin-top:12px"></div>
+
+    <!-- 全局开始下载 -->
+    <div style="margin-top:14px;display:flex;justify-content:flex-end">
+      <button class="btn-green" id="btn-dl" onclick="startDownload()">⬇ 开始下载</button>
+    </div>
+
+    <!-- 下载进度（动态显示） -->
+    <div id="progress-card" style="display:none;margin-top:16px">
+      <hr style="border:none;border-top:1px solid #e5e7eb;margin-bottom:12px">
+      <div id="status" style="font-size:13px;color:#555;min-height:20px">准备中…</div>
+      <div class="progress-bar-wrap" id="pb-wrap"><div class="progress-bar" id="pb"></div></div>
+      <div id="log-box"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let allTables = [];
+
+// ============================================================
+// 账号卡片（多账号并行配置）
+// ============================================================
+function _accountCardHTML(idx, cfg) {
+  cfg = cfg || {};
+  const removable = idx > 0 ? '' : 'display:none';
+  // 已有 Coze Token 视为"配过的卡片"，默认折叠；新加的空卡默认展开
+  const collapsed = (cfg.cozeToken || '').trim() !== '';
+  const bodyStyle = collapsed ? 'display:none' : '';
+  const toggleIcon = collapsed ? '▶' : '▼';
+  return `
+  <div class="account-card" data-acc-idx="${idx}"
+       style="padding:12px 14px;background:#f5f3ff;border-radius:10px;margin-bottom:10px;border:1px solid #e9d5ff;position:relative">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;gap:8px">
+      <span class="acc-toggle" onclick="_toggleAccountCard(this)"
+            title="点击展开 / 收起"
+            style="cursor:pointer;user-select:none;font-size:12px;color:#7c3aed;width:14px;display:inline-block;text-align:center">${toggleIcon}</span>
+      <div onclick="_toggleAccountCard(this)"
+           title="点击展开 / 收起"
+           style="cursor:pointer;font-size:12px;color:#6d28d9;font-weight:700;white-space:nowrap">
+        账号 #<span class="acc-num">${idx+1}</span><span class="acc-name-tag" style="color:#a78bfa;margin-left:4px"></span>
+      </div>
+      <input class="acc-name" placeholder="📛 别名（如：冯会宁组）" value="${cfg.name||''}"
+             oninput="_onAccountNameInput(this)" onclick="event.stopPropagation()"
+             style="flex:1;max-width:240px;padding:4px 8px;font-size:12px;border:1px solid #ddd6fe;border-radius:6px">
+      <button onclick="event.stopPropagation();removeAccountCard(this)" title="移除此账号"
+              style="${removable};padding:3px 9px;background:#fee2e2;color:#b91c1c;border:1px solid #fecaca;
+                     border-radius:5px;cursor:pointer;font-size:11px">🗑 移除</button>
+    </div>
+    <div class="acc-body" style="${bodyStyle}">
+    <div style="display:flex;gap:10px;margin-bottom:8px">
+      <div style="flex:1">
+        <label style="font-size:12px;color:#6d28d9;font-weight:600">Coze Token</label>
+        <input class="acc-coze-token" placeholder="sat_..." value="${cfg.cozeToken||''}"
+               style="border-color:#c4b5fd" oninput="autoSaveConfig()">
+      </div>
+      <div style="flex:1">
+        <label style="font-size:12px;color:#6d28d9;font-weight:600">Workflow ID</label>
+        <input class="acc-workflow-id" placeholder="7xxxxxxxxxxxxxxxxx" value="${cfg.workflowId||''}"
+               style="border-color:#c4b5fd" oninput="autoSaveConfig()">
+      </div>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:8px">
+      <div style="flex:1">
+        <label style="font-size:12px;color:#6d28d9;font-weight:600">飞书 Base Token（留空则读取下方下载区配置）</label>
+        <input class="acc-base-token" placeholder="留空则使用下方 Base Token" value="${cfg.baseToken||''}"
+               oninput="autoSaveConfig()">
+      </div>
+      <div style="flex:1">
+        <label style="font-size:12px;color:#6d28d9;font-weight:600">飞书用户Token
+          <span style="font-weight:400;color:#9a3fbf">（写台账，有权限时用）</span>
+        </label>
+        <input class="acc-feishu-utoken" placeholder="u-xxxxxxxx..." value="${cfg.feishuUserToken||''}"
+               oninput="autoSaveConfig()">
+      </div>
+    </div>
+    <div style="margin-top:8px;padding:8px 10px;background:#faf5ff;border-radius:8px;border:1px solid #e9d5ff">
+      <div style="font-size:11px;color:#7c3aed;font-weight:700;margin-bottom:6px">
+        🔑 飞书 App 认证（推荐，替代用户Token）
+      </div>
+      <div style="display:flex;gap:10px">
+        <div style="flex:1">
+          <label style="font-size:11px;color:#6d28d9;font-weight:600">App ID</label>
+          <input class="acc-feishu-appid" placeholder="cli_xxxxxxxx" value="${cfg.feishuAppId||''}"
+                 style="border-color:#c4b5fd;font-size:12px" oninput="autoSaveConfig()">
+        </div>
+        <div style="flex:1">
+          <label style="font-size:11px;color:#6d28d9;font-weight:600">App Secret</label>
+          <input class="acc-feishu-appsecret" placeholder="xxxxxxxxxxxxxxxx" value="${cfg.feishuAppSecret||''}"
+                 type="password" style="border-color:#c4b5fd;font-size:12px" oninput="autoSaveConfig()">
+        </div>
+      </div>
+    </div>
+    </div>
+  </div>`;
+}
+
+// 切换账号卡的展开/折叠（el 可以是 toggle 图标，也可以是标题文字 div）
+function _toggleAccountCard(el) {
+  const card = el.closest('.account-card');
+  if (!card) return;
+  const body   = card.querySelector('.acc-body');
+  const toggle = card.querySelector('.acc-toggle');
+  if (!body) return;
+  const isHidden = body.style.display === 'none';
+  body.style.display = isHidden ? '' : 'none';
+  if (toggle) toggle.textContent = isHidden ? '▼' : '▶';
+}
+
+// 一键展开/收起所有账号卡
+function _toggleAllAccountCards(expand) {
+  document.querySelectorAll('#auto-accounts-list .account-card').forEach(card => {
+    const body = card.querySelector('.acc-body');
+    const toggle = card.querySelector('.acc-toggle');
+    if (!body) return;
+    body.style.display = expand ? '' : 'none';
+    if (toggle) toggle.textContent = expand ? '▼' : '▶';
+  });
+}
+
+function _renumberAccountCards() {
+  document.querySelectorAll('#auto-accounts-list .account-card').forEach((card, i) => {
+    card.setAttribute('data-acc-idx', i);
+    const num = card.querySelector('.acc-num'); if (num) num.textContent = i + 1;
+    const rm  = card.querySelector('button[onclick^="removeAccountCard"]');
+    if (rm) rm.style.display = (i === 0 ? 'none' : '');
+    // 同步标题中的别名 tag
+    const name = (card.querySelector('.acc-name')?.value || '').trim();
+    const tag  = card.querySelector('.acc-name-tag');
+    if (tag) tag.textContent = name ? (' · ' + name) : '';
+  });
+  // 账号增减/重命名后，刷新所有产品卡的"补到账号"下拉
+  if (typeof _refreshMakeupAccountOptions === 'function') _refreshMakeupAccountOptions();
+}
+
+// 别名输入：只更新本卡 tag + 下拉框，不重渲（避免输入框失焦）
+function _onAccountNameInput(input) {
+  const card = input.closest('.account-card');
+  if (!card) return;
+  const tag = card.querySelector('.acc-name-tag');
+  const name = (input.value || '').trim();
+  if (tag) tag.textContent = name ? (' · ' + name) : '';
+  if (typeof _refreshMakeupAccountOptions === 'function') _refreshMakeupAccountOptions();
+  autoSaveConfig();
+}
+
+function addAccountCard(cfg) {
+  const list = document.getElementById('auto-accounts-list');
+  const idx  = list.querySelectorAll('.account-card').length;
+  list.insertAdjacentHTML('beforeend', _accountCardHTML(idx, cfg || {}));
+  _renumberAccountCards();
+  autoSaveConfig();
+}
+
+function removeAccountCard(btn) {
+  const card = btn.closest('.account-card');
+  if (!card) return;
+  card.remove();
+  _renumberAccountCards();
+  autoSaveConfig();
+}
+
+function getAccounts() {
+  return Array.from(document.querySelectorAll('#auto-accounts-list .account-card')).map(card => ({
+    name:            (card.querySelector('.acc-name')?.value || '').trim(),
+    cozeToken:       (card.querySelector('.acc-coze-token').value || '').trim(),
+    workflowId:      (card.querySelector('.acc-workflow-id').value || '').trim(),
+    baseToken:       (card.querySelector('.acc-base-token').value || '').trim(),
+    feishuUserToken: (card.querySelector('.acc-feishu-utoken').value || '').trim(),
+    feishuAppId:     (card.querySelector('.acc-feishu-appid').value || '').trim(),
+    feishuAppSecret: (card.querySelector('.acc-feishu-appsecret').value || '').trim(),
+  }));
+}
+
+function renderAccountCards(accounts) {
+  const list = document.getElementById('auto-accounts-list');
+  list.innerHTML = '';
+  (accounts && accounts.length ? accounts : [{}]).forEach((cfg, i) => {
+    list.insertAdjacentHTML('beforeend', _accountCardHTML(i, cfg));
+  });
+  _renumberAccountCards();
+}
+
+// ============================================================
+// 持久化：加载 & 保存状态
+// ============================================================
+async function loadState() {
+  try {
+    const res = await fetch('/api/state');
+    const state = await res.json();
+
+    // 1. 还原账号卡片：优先用新版 accounts 数组，否则兼容旧版平铺字段
+    const cfg = state.config || {};
+    let accounts = Array.isArray(cfg.accounts) ? cfg.accounts : null;
+    if (!accounts || !accounts.length) {
+      accounts = [{
+        cozeToken:       cfg.coze_token       || '',
+        workflowId:      cfg.workflow_id      || '',
+        baseToken:       cfg.auto_base_token  || '',
+        feishuUserToken: cfg.feishu_utoken    || '',
+        feishuAppId:     cfg.feishu_appid     || '',
+        feishuAppSecret: cfg.feishu_appsecret || '',
+      }];
+    }
+    renderAccountCards(accounts);
+
+    if (cfg.cookie)           document.getElementById('cookie').value = cfg.cookie;
+    if (cfg.field_id)         document.getElementById('fieldId').value = cfg.field_id;
+    if (cfg.output_dir)       document.getElementById('outputDir').value = cfg.output_dir;
+    if (typeof cfg.force_redownload === 'boolean') document.getElementById('forceRedownload').checked = cfg.force_redownload;
+    if (typeof cfg.min_size_kb === 'number')       document.getElementById('minSizeKb').value = cfg.min_size_kb;
+    if (typeof cfg.make_zip === 'boolean')         document.getElementById('makeZip').checked = cfg.make_zip;
+    if (typeof cfg.delete_after_zip === 'boolean') document.getElementById('deleteAfterZip').checked = cfg.delete_after_zip;
+
+    // 多 Base 卡片：优先用新的 dl_bases；否则从旧版 dl_base_token 迁移
+    if (Array.isArray(cfg.dl_bases) && cfg.dl_bases.length > 0) {
+      _dlBases = cfg.dl_bases.map(b => _newDlBase(b.baseToken || '', b.fieldId || '', b.name || ''));
+    } else if (cfg.dl_base_token) {
+      _dlBases = [_newDlBase(cfg.dl_base_token, '', '')];
+    } else {
+      ensureAtLeastOneDlBase();
+    }
+    renderDlBases();
+
+    // 2. 还原清洗数据（若有）
+    const products = state.parsed_products;
+    if (Array.isArray(products) && products.length > 0) {
+      _parsedProducts = products;
+      // 重建摘要
+      const total = _parsedProducts.reduce((s, p) => s + p.count, 0);
+      const groups = new Set(_parsedProducts.map(p => p.key.split('_')[1] || ''));
+      const batchDate = (_parsedProducts[0].key.split('_')[0] || '-');
+      document.getElementById('auto-preview-summary').innerHTML =
+        '📅 批次: <b>' + batchDate + '</b>'
+        + '&nbsp;&nbsp;|&nbsp;&nbsp;🏢 ' + groups.size + ' 个组'
+        + '&nbsp;&nbsp;|&nbsp;&nbsp;📦 ' + _parsedProducts.length + ' 个产品'
+        + '&nbsp;&nbsp;|&nbsp;&nbsp;📝 共 <b>' + total + '</b> 条'
+        + '&nbsp;&nbsp;<span style="font-size:11px;color:#a78bfa">（已从上次保存恢复）</span>';
+      rerenderProductList();
+      updateAutoSelectCount();
+      // 切到 Stage 2
+      document.getElementById('auto-s1').style.display = 'none';
+      document.getElementById('auto-s2').style.display = 'block';
+    }
+  } catch(e) { console.warn('loadState 失败:', e); }
+  // 防御：即使前面流程异常，也保证至少 1 张 Base 卡片可见
+  if (!Array.isArray(_dlBases) || _dlBases.length === 0) {
+    ensureAtLeastOneDlBase();
+    renderDlBases();
+  }
+}
+
+// 保存配置字段（防抖 800ms）
+let _cfgTimer = null;
+function autoSaveConfig() {
+  clearTimeout(_cfgTimer);
+  _cfgTimer = setTimeout(() => {
+    fetch('/api/state', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ config: {
+        accounts:        getAccounts(),
+        dl_bases:        _dlBases.map(b => ({ name: b.name, baseToken: b.baseToken, fieldId: b.fieldId })),
+        cookie:          document.getElementById('cookie').value.trim(),
+        field_id:        document.getElementById('fieldId').value.trim(),
+        output_dir:      document.getElementById('outputDir').value.trim(),
+        force_redownload: document.getElementById('forceRedownload').checked,
+        min_size_kb:     parseInt(document.getElementById('minSizeKb').value || '50', 10),
+        make_zip:        document.getElementById('makeZip').checked,
+        delete_after_zip: document.getElementById('deleteAfterZip').checked,
+      }})
+    });
+  }, 800);
+}
+
+// 保存清洗数据
+function saveParsedProducts() {
+  fetch('/api/state', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ parsed_products: _parsedProducts })
+  });
+}
+
+// 页面加载完成后自动还原
+window.addEventListener('DOMContentLoaded', () => {
+  loadState();
+  if (typeof _restoreBatchDate === 'function') _restoreBatchDate();
+  // 钉钉 Tab 初始化
+  if (typeof _restoreDtDefaultDate === 'function') _restoreDtDefaultDate();
+  if (typeof dtRefreshStatus === 'function') dtRefreshStatus();
+});
+
