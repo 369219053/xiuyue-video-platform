@@ -5739,8 +5739,17 @@ def _bitable_monitor_loop():
         _bitable_log("❌ 缺少 BITABLE_APP_TOKEN 或 BITABLE_TABLE_ID，请检查配置")
         return
 
-    _bitable_log("✅ 监控已启动，每2秒扫描一次")
+    test_mode = not any([wf2_id, wf3_id, wf4_id])
+    if test_mode:
+        _bitable_log("🔍 [诊断模式] 未配置工作流ID，只读取字段，不触发工作流")
+    else:
+        _bitable_log(f"✅ 监控已启动，每2秒扫描一次")
+        _bitable_log(f"   阶段2(生图): {'✅ ' + wf2_id[:12] + '...' if wf2_id else '⏭ 未配置'}")
+        _bitable_log(f"   阶段3(生视频): {'✅ ' + wf3_id[:12] + '...' if wf3_id else '⏭ 未配置'}")
+        _bitable_log(f"   阶段4(加字幕): {'✅ ' + wf4_id[:12] + '...' if wf4_id else '⏭ 未配置'}")
+
     _feishu_token = {"val": "", "expire": 0}
+    _diag_done = False  # 诊断模式只打印一次详细字段
 
     def get_token():
         import time
@@ -5757,12 +5766,38 @@ def _bitable_monitor_loop():
             tk = get_token()
             records = _bitable_list_records(tk, app_token, table_id)
 
+            if test_mode and not _diag_done:
+                _diag_done = True
+                _bitable_log(f"📋 共读取到 {len(records)} 条记录")
+                WATCH_FIELDS = ["生图提示词", "图片url", "启动视频", "视频提示词", "比例", "字幕", "视频生成", "时长"]
+                cnt2 = cnt3 = cnt4 = 0
+                for i, rec in enumerate(records[:5]):   # 最多展示前5条
+                    fv = {fn: _get_field(rec, fn) for fn in WATCH_FIELDS}
+                    _bitable_log(f"  记录{i+1} [{rec['record_id'][:8]}]:")
+                    for fn, fval in fv.items():
+                        display = (fval[:40] + "…") if len(fval) > 40 else fval
+                        status = "✅" if fval else "○"
+                        _bitable_log(f"    {status} {fn}: {display or '(空)'}")
+                # 统计各阶段匹配数
+                for rec in records:
+                    f = lambda name, r=rec: _get_field(r, name)
+                    if f("生图提示词") and f("比例") and not f("图片url"):
+                        cnt2 += 1
+                    elif f("图片url") and f("启动视频") == "1" and not f("视频生成"):
+                        cnt3 += 1
+                    elif f("视频生成") and f("字幕") and not f("视频url"):
+                        cnt4 += 1
+                _bitable_log(f"📊 符合阶段2(待生图): {cnt2} 条")
+                _bitable_log(f"📊 符合阶段3(待生视频): {cnt3} 条")
+                _bitable_log(f"📊 符合阶段4(待加字幕): {cnt4} 条")
+                _bitable_log("✅ 诊断完成，可停止监控或填入工作流ID后重新启动")
+
             tasks2, tasks3, tasks4 = [], [], []
             for rec in records:
                 rid = rec["record_id"]
                 if rid in in_progress:
                     continue
-                f = lambda name: _get_field(rec, name)
+                f = lambda name, r=rec: _get_field(r, name)
 
                 # 阶段2：有生图提示词+比例，但图片URL为空
                 if wf2_id and f("生图提示词") and f("比例") and not f("图片url"):
