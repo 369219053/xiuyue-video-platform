@@ -3074,16 +3074,25 @@ HTML = """<!DOCTYPE html>
   <!-- ============================================================ -->
   <div class="card" id="bitable-monitor-card"
        style="border:2px solid #0ea5e9;background:linear-gradient(135deg,#f0f9ff 0%,#fff 60%);margin-top:20px">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
       <h2 style="color:#0369a1;margin:0">🤖 飞书多维表格自动监控</h2>
-      <button onclick="bmAddGroup()"
-              style="padding:5px 14px;background:#0ea5e9;color:#fff;border:none;
-                     border-radius:6px;cursor:pointer;font-size:13px;font-weight:600">
-        ➕ 添加监控组
-      </button>
+      <div style="display:flex;gap:8px">
+        <button onclick="bmSyncFromAccounts()"
+                title="把上方账号卡片的 Base Token + Coze Token + WF3/4 ID 一键同步到监控组"
+                style="padding:5px 14px;background:#0284c7;color:#fff;border:none;
+                       border-radius:6px;cursor:pointer;font-size:13px;font-weight:600">
+          🔄 从账号配置同步
+        </button>
+        <button onclick="bmAddGroup()"
+                style="padding:5px 14px;background:#0ea5e9;color:#fff;border:none;
+                       border-radius:6px;cursor:pointer;font-size:13px;font-weight:600">
+          ➕ 手动添加组
+        </button>
+      </div>
     </div>
     <p style="font-size:12px;color:#64748b;margin-bottom:14px">
-      替代「字段捷径」，支持多个多维表格 × 多个 Coze 账号同时监控，无并发限制。
+      替代「字段捷径」，支持多个多维表格 × 多个 Coze 账号同时监控，无并发限制。<br>
+      <b style="color:#0369a1">💡 建议：在上方账号卡片填好「生视频/加字幕 WF ID」后点「从账号配置同步」，一键完成配置。</b>
     </p>
 
     <!-- 监控组列表 -->
@@ -3168,9 +3177,31 @@ function _accountCardHTML(idx, cfg) {
                style="border-color:#c4b5fd" oninput="autoSaveConfig()">
       </div>
       <div style="flex:1">
-        <label style="font-size:12px;color:#6d28d9;font-weight:600">Workflow ID</label>
+        <label style="font-size:12px;color:#6d28d9;font-weight:600">工作流1 ID（建副表用）</label>
         <input class="acc-workflow-id" placeholder="7xxxxxxxxxxxxxxxxx" value="${cfg.workflowId||''}"
                style="border-color:#c4b5fd" oninput="autoSaveConfig()">
+      </div>
+    </div>
+    <div style="margin-bottom:8px;padding:8px 10px;background:#f0f9ff;border-radius:8px;border:1px solid #bae6fd">
+      <div style="font-size:11px;color:#0369a1;font-weight:700;margin-bottom:6px">
+        🤖 监控工作流（生图/视频/字幕，与建副表并行运行）
+      </div>
+      <div style="display:flex;gap:10px">
+        <div style="flex:1">
+          <label style="font-size:11px;color:#0369a1;font-weight:600">生图 WF ID（阶段2，留空跳过）</label>
+          <input class="acc-wf2" placeholder="7xxxxxxxxxxxxxxxxx" value="${cfg.wf2||''}"
+                 style="border-color:#7dd3fc;font-size:12px" oninput="autoSaveConfig()">
+        </div>
+        <div style="flex:1">
+          <label style="font-size:11px;color:#0369a1;font-weight:600">生视频 WF ID（阶段3）</label>
+          <input class="acc-wf3" placeholder="7xxxxxxxxxxxxxxxxx" value="${cfg.wf3||''}"
+                 style="border-color:#7dd3fc;font-size:12px" oninput="autoSaveConfig()">
+        </div>
+        <div style="flex:1">
+          <label style="font-size:11px;color:#0369a1;font-weight:600">加字幕 WF ID（阶段4）</label>
+          <input class="acc-wf4" placeholder="7xxxxxxxxxxxxxxxxx" value="${cfg.wf4||''}"
+                 style="border-color:#7dd3fc;font-size:12px" oninput="autoSaveConfig()">
+        </div>
       </div>
     </div>
     <div style="display:flex;gap:10px;margin-top:8px">
@@ -3282,6 +3313,9 @@ function getAccounts() {
     feishuUserToken: (card.querySelector('.acc-feishu-utoken').value || '').trim(),
     feishuAppId:     (card.querySelector('.acc-feishu-appid').value || '').trim(),
     feishuAppSecret: (card.querySelector('.acc-feishu-appsecret').value || '').trim(),
+    wf2:             (card.querySelector('.acc-wf2')?.value || '').trim(),
+    wf3:             (card.querySelector('.acc-wf3')?.value || '').trim(),
+    wf4:             (card.querySelector('.acc-wf4')?.value || '').trim(),
   }));
 }
 
@@ -5601,6 +5635,29 @@ function bmAddGroup() {
   bmRenderGroups();
 }
 
+// ── 从账号卡片一键同步到监控组 ──
+function bmSyncFromAccounts() {
+  const accs = (typeof getAccounts === 'function') ? getAccounts() : [];
+  const dlBase = (_dlBases && _dlBases[0] && _dlBases[0].baseToken) ? _dlBases[0].baseToken : '';
+  const synced = accs
+    .map(a => ({
+      name:       a.name || '',
+      appToken:   a.baseToken || dlBase,
+      cozeToken:  a.cozeToken || '',
+      wf2:        a.wf2 || '',
+      wf3:        a.wf3 || '',
+      wf4:        a.wf4 || '',
+    }))
+    .filter(g => g.appToken);  // 至少有 Base Token 才加进来
+  if (!synced.length) {
+    alert('账号卡片里没有填写 Base Token，请先在账号区填好 Base Token（和监控 WF ID），再同步。');
+    return;
+  }
+  _bmGroups = synced;
+  bmRenderGroups();
+  alert(`✅ 已从 ${synced.length} 个账号同步监控配置，请确认后点「▶ 全部启动」`);
+}
+
 function bmRemoveGroup(i) {
   _bmGroups.splice(i, 1);
   bmRenderGroups();
@@ -5786,14 +5843,27 @@ def _bitable_list_records(token: str, app_token: str, table_id: str) -> list:
     return records
 
 def _bitable_update_record(token: str, app_token: str, table_id: str, record_id: str, fields: dict):
-    """更新单条记录的字段"""
+    """更新单条记录的字段，遇到限流无限重试直到成功（记录在in_progress中不会重复触发工作流）"""
+    import time as _time
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    resp = requests.put(
-        f"{_FEISHU_HOST_API}/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}",
-        headers=headers, json={"fields": fields}, timeout=15
-    )
-    data = resp.json()
-    if data.get("code") != 0:
+    url = f"{_FEISHU_HOST_API}/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}"
+    attempt = 0
+    while True:
+        resp = requests.put(url, headers=headers, json={"fields": fields}, timeout=15)
+        data = resp.json()
+        code = data.get("code", 0)
+        if code == 0:
+            if attempt > 0:
+                _bitable_log(f"  ✅ 写回成功（第{attempt+1}次重试后）")
+            return
+        # 限流：指数退避，最长每次等60秒，无限重试
+        if code in (429, 1254003) or resp.status_code == 429:
+            wait = min(2 ** attempt, 60)
+            _bitable_log(f"  ⚠️ 飞书限流，{wait}秒后第{attempt+1}次重试写回…")
+            _time.sleep(wait)
+            attempt += 1
+            continue
+        # 其他真实错误（字段名不对等）直接抛出，不重试
         raise RuntimeError(f"写回失败: {data}")
 
 def _call_coze_workflow(workflow_id: str, params: dict, coze_token: str = "") -> dict:
@@ -5805,7 +5875,7 @@ def _call_coze_workflow(workflow_id: str, params: dict, coze_token: str = "") ->
         f"{base_url}/v1/workflow/run",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         json={"workflow_id": workflow_id, "parameters": params},
-        timeout=300
+        timeout=3600
     )
     data = resp.json()
     if data.get("code") != 0:
@@ -5904,9 +5974,9 @@ def _bitable_monitor_one_group(group: dict, executor, in_progress: set, tk_cache
             f = lambda n, r=rec: _get_field(r, n)
             if wf2_id and f("生图提示词") and f("比例") and not f("图片url"):
                 tasks2.append(rec)
-            elif wf3_id and f("启动视频") and f("图片url") and f("视频提示词") and f("比例"):
+            elif wf3_id and f("启动视频") and f("图片url") and f("视频提示词") and f("比例") and not f("视频生成"):
                 tasks3.append(rec)
-            elif wf4_id and f("视频生成") and f("字幕") and not f("视频url"):
+            elif wf4_id and f("视频生成") and f("字幕") and not f("视频剪辑"):
                 tasks4.append(rec)
 
         def run_stage2(rec, tid=table_id, tname=table_name):
@@ -5961,8 +6031,7 @@ def _bitable_monitor_one_group(group: dict, executor, in_progress: set, tk_cache
                     url = url[0]
                 url = str(url).strip() if url else ""
                 if url:
-                    # 写入视频url，同时清空「启动视频」防止重复触发
-                    _bitable_update_record(tk, app_token, tid, rid, {"视频生成": url, "启动视频": ""})
+                    _bitable_update_record(tk, app_token, tid, rid, {"视频生成": url})
                     _bitable_log(f"✅ [{label}][{tname}] 生视频完成 {rid[:8]} → {url[:60]}")
                     with _bitable_monitor_lock: _bitable_monitor_stats["stage3"] += 1
                 else:
@@ -5994,7 +6063,7 @@ def _bitable_monitor_one_group(group: dict, executor, in_progress: set, tk_cache
                     url = url[0]
                 url = str(url).strip() if url else ""
                 if url:
-                    _bitable_update_record(tk, app_token, tid, rid, {"视频url": url})
+                    _bitable_update_record(tk, app_token, tid, rid, {"视频剪辑": url})
                     _bitable_log(f"✅ [{label}][{tname}] 加字幕完成 {rid[:8]} → {url[:60]}")
                     with _bitable_monitor_lock: _bitable_monitor_stats["stage4"] += 1
                 else:
@@ -6017,7 +6086,7 @@ def _bitable_monitor_loop():
     global _bitable_monitor_stats
     import time
     _bitable_log(f"✅ 监控已启动，共 {len(_bitable_monitor_configs)} 个监控组")
-    executor    = _futures.ThreadPoolExecutor(max_workers=30)
+    executor    = _futures.ThreadPoolExecutor(max_workers=500)
     in_progress = set()
     tk_cache    = {"val": "", "expire": 0}
 
