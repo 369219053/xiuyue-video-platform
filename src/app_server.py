@@ -3053,71 +3053,58 @@ HTML = """<!DOCTYPE html>
   </div>
 
   <!-- ============================================================ -->
-  <!-- 飞书多维表格自动监控卡片                                      -->
+  <!-- 飞书多维表格自动监控卡片（多表格 × 多账号）                    -->
   <!-- ============================================================ -->
   <div class="card" id="bitable-monitor-card"
        style="border:2px solid #0ea5e9;background:linear-gradient(135deg,#f0f9ff 0%,#fff 60%);margin-top:20px">
-    <h2 style="color:#0369a1;margin-bottom:12px">🤖 飞书多维表格自动监控</h2>
-    <p style="font-size:13px;color:#475569;margin-bottom:14px">
-      替代「字段捷径」，绕过并发限制（原最多2-4个），自动扫描表格 → 调用 Coze 工作流 → 写回结果。<br>
-      <span style="color:#0ea5e9;font-weight:600">监控目标表格由 .env 中的 BITABLE_APP_TOKEN / BITABLE_TABLE_ID 决定。</span>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+      <h2 style="color:#0369a1;margin:0">🤖 飞书多维表格自动监控</h2>
+      <button onclick="bmAddGroup()"
+              style="padding:5px 14px;background:#0ea5e9;color:#fff;border:none;
+                     border-radius:6px;cursor:pointer;font-size:13px;font-weight:600">
+        ➕ 添加监控组
+      </button>
+    </div>
+    <p style="font-size:12px;color:#64748b;margin-bottom:14px">
+      替代「字段捷径」，支持多个多维表格 × 多个 Coze 账号同时监控，无并发限制。
     </p>
 
-    <!-- 工作流 ID 配置行 -->
-    <div style="display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap">
-      <div style="flex:1;min-width:200px">
-        <label style="font-size:12px;color:#0369a1;font-weight:600">阶段2 Workflow ID（生图）</label>
-        <input id="bm-wf2" placeholder="7xxxxxxxxxxxxxxxxx"
-               style="border-color:#7dd3fc;font-size:13px;margin-top:4px"
-               oninput="bmSaveWfIds()">
-      </div>
-      <div style="flex:1;min-width:200px">
-        <label style="font-size:12px;color:#0369a1;font-weight:600">阶段3 Workflow ID（生视频）</label>
-        <input id="bm-wf3" placeholder="7xxxxxxxxxxxxxxxxx"
-               style="border-color:#7dd3fc;font-size:13px;margin-top:4px"
-               oninput="bmSaveWfIds()">
-      </div>
-      <div style="flex:1;min-width:200px">
-        <label style="font-size:12px;color:#0369a1;font-weight:600">阶段4 Workflow ID（加字幕）</label>
-        <input id="bm-wf4" placeholder="7xxxxxxxxxxxxxxxxx"
-               style="border-color:#7dd3fc;font-size:13px;margin-top:4px"
-               oninput="bmSaveWfIds()">
-      </div>
-    </div>
+    <!-- 监控组列表 -->
+    <div id="bm-groups-list"></div>
 
-    <!-- 控制按钮 + 统计 -->
-    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px">
-      <button id="bm-btn-start" onclick="bmStart()"
-              style="padding:8px 22px;background:linear-gradient(135deg,#0ea5e9,#0284c7);color:#fff;
-                     border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:700">
-        ▶ 启动监控
-      </button>
-      <button id="bm-btn-stop" onclick="bmStop()" disabled
-              style="padding:8px 22px;background:#e2e8f0;color:#94a3b8;
-                     border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:700">
-        ⏹ 停止监控
-      </button>
-      <span id="bm-status-badge"
-            style="padding:4px 12px;border-radius:20px;font-size:12px;font-weight:700;
+    <!-- 全局控制栏 -->
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+                padding:10px 14px;background:#f0f9ff;border:1px solid #bae6fd;
+                border-radius:8px;margin-top:10px">
+      <button id="bm-btn-start-all"
+              style="padding:7px 20px;background:linear-gradient(135deg,#0ea5e9,#0284c7);color:#fff;
+                     border:none;border-radius:7px;cursor:pointer;font-size:13px;font-weight:700"
+              onclick="bmStartAll()">▶ 全部启动</button>
+      <button id="bm-btn-stop-all"
+              style="padding:7px 20px;background:#e2e8f0;color:#64748b;
+                     border:none;border-radius:7px;cursor:pointer;font-size:13px;font-weight:700"
+              onclick="bmStopAll()">⏹ 全部停止</button>
+      <span id="bm-global-badge"
+            style="padding:3px 10px;border-radius:16px;font-size:12px;font-weight:700;
                    background:#f1f5f9;color:#64748b">⚪ 未运行</span>
-      <div style="display:flex;gap:16px;font-size:12px;color:#475569;margin-left:auto">
-        <span>🎨 生图完成: <b id="bm-stat2">0</b></span>
-        <span>🎬 生视频完成: <b id="bm-stat3">0</b></span>
-        <span>📝 加字幕完成: <b id="bm-stat4">0</b></span>
-        <span>❌ 错误: <b id="bm-stat-err" style="color:#ef4444">0</b></span>
+      <div style="margin-left:auto;display:flex;gap:14px;font-size:12px;color:#475569">
+        <span>🎨 <b id="bm-tot2">0</b></span>
+        <span>🎬 <b id="bm-tot3">0</b></span>
+        <span>📝 <b id="bm-tot4">0</b></span>
+        <span style="color:#ef4444">❌ <b id="bm-tot-err">0</b></span>
       </div>
     </div>
 
     <!-- 实时日志 -->
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
-      <span style="font-size:12px;color:#64748b;font-weight:600">📋 实时日志（最新50条）</span>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin:10px 0 4px">
+      <span style="font-size:12px;color:#64748b;font-weight:600">📋 实时日志</span>
       <button onclick="document.getElementById('bm-log').textContent=''"
               style="font-size:11px;padding:2px 8px;background:#f1f5f9;border:1px solid #e2e8f0;
                      border-radius:4px;cursor:pointer;color:#64748b">清空</button>
     </div>
     <div id="bm-log"
          style="background:#0f172a;color:#94a3b8;font-family:monospace;font-size:12px;
-                padding:12px;border-radius:8px;height:200px;overflow-y:auto;white-space:pre-wrap">
+                padding:12px;border-radius:8px;height:220px;overflow-y:auto;white-space:pre-wrap">
 等待启动监控…
     </div>
   </div>
@@ -5534,93 +5521,166 @@ function sideAction(type) {
 
 
 // ============================================================
-// 飞书多维表格监控 UI 逻辑
+// 飞书多维表格监控 UI 逻辑（多组版）
 // ============================================================
+let _bmGroups = [];      // [{name,appToken,tableId,cozeToken,wf2,wf3,wf4}, ...]
 let _bmPollTimer = null;
 
-function bmStart() {
-  const wf2 = document.getElementById('bm-wf2').value.trim();
-  const wf3 = document.getElementById('bm-wf3').value.trim();
-  const wf4 = document.getElementById('bm-wf4').value.trim();
+// ── 渲染监控组列表 ──
+function bmRenderGroups() {
+  const list = document.getElementById('bm-groups-list');
+  if (!list) return;
+  list.innerHTML = _bmGroups.map((g, i) => bmGroupHTML(g, i)).join('');
+  bmSaveGroups();
+}
+
+function bmGroupHTML(g, i) {
+  const iStyle = 'border:1px solid #bae6fd;border-radius:9px;padding:10px 12px;margin-bottom:8px;background:#fff';
+  const lbStyle = 'font-size:11px;color:#0369a1;font-weight:600;display:block;margin-bottom:2px';
+  const inStyle = 'border-color:#7dd3fc;font-size:12px;padding:4px 8px;width:100%';
+  return '<div style="' + iStyle + '" data-bm-idx="' + i + '">'
+    + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">'
+    +   '<span style="font-size:13px;font-weight:700;color:#0369a1;flex:1">监控组 #' + (i+1)
+    +     (g.name ? (' · ' + g.name) : '') + '</span>'
+    +   '<button onclick="bmRemoveGroup(' + i + ')" style="font-size:11px;padding:2px 8px;'
+    +     'background:#fee2e2;color:#b91c1c;border:1px solid #fca5a5;border-radius:5px;cursor:pointer">🗑 移除</button>'
+    + '</div>'
+    + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">'
+    +   '<div><label style="' + lbStyle + '">别名（选填）</label>'
+    +     '<input style="' + inStyle + '" placeholder="如：刘原原组" value="' + (g.name||'') + '"'
+    +     ' oninput="bmGroupChange(' + i + ',this,\'name\')">'
+    +   '</div>'
+    +   '<div><label style="' + lbStyle + '">Coze Token</label>'
+    +     '<input style="' + inStyle + '" placeholder="sat_..." value="' + (g.cozeToken||'') + '"'
+    +     ' oninput="bmGroupChange(' + i + ',this,\'cozeToken\')">'
+    +   '</div>'
+    +   '<div><label style="' + lbStyle + '">多维表格 Base Token</label>'
+    +     '<input style="' + inStyle + '" placeholder="NMwjbb..." value="' + (g.appToken||'') + '"'
+    +     ' oninput="bmGroupChange(' + i + ',this,\'appToken\')">'
+    +   '</div>'
+    +   '<div><label style="' + lbStyle + '">Table ID</label>'
+    +     '<input style="' + inStyle + '" placeholder="tbl..." value="' + (g.tableId||'') + '"'
+    +     ' oninput="bmGroupChange(' + i + ',this,\'tableId\')">'
+    +   '</div>'
+    +   '<div><label style="' + lbStyle + '">阶段2 Workflow（生图）</label>'
+    +     '<input style="' + inStyle + '" placeholder="7xxxxxxxxx（留空=跳过）" value="' + (g.wf2||'') + '"'
+    +     ' oninput="bmGroupChange(' + i + ',this,\'wf2\')">'
+    +   '</div>'
+    +   '<div><label style="' + lbStyle + '">阶段3 Workflow（生视频）</label>'
+    +     '<input style="' + inStyle + '" placeholder="7xxxxxxxxx（留空=跳过）" value="' + (g.wf3||'') + '"'
+    +     ' oninput="bmGroupChange(' + i + ',this,\'wf3\')">'
+    +   '</div>'
+    +   '<div><label style="' + lbStyle + '">阶段4 Workflow（加字幕）</label>'
+    +     '<input style="' + inStyle + '" placeholder="7xxxxxxxxx（留空=跳过）" value="' + (g.wf4||'') + '"'
+    +     ' oninput="bmGroupChange(' + i + ',this,\'wf4\')">'
+    +   '</div>'
+    + '</div>'
+    + '</div>';
+}
+
+function bmGroupChange(i, el, field) {
+  if (_bmGroups[i]) _bmGroups[i][field] = el.value.trim();
+  bmSaveGroups();
+}
+
+function bmAddGroup() {
+  _bmGroups.push({ name:'', appToken:'', tableId:'', cozeToken:'', wf2:'', wf3:'', wf4:'' });
+  bmRenderGroups();
+}
+
+function bmRemoveGroup(i) {
+  _bmGroups.splice(i, 1);
+  bmRenderGroups();
+}
+
+function bmSaveGroups() {
+  try { localStorage.setItem('bm_groups', JSON.stringify(_bmGroups)); } catch(e) {}
+}
+
+function bmLoadGroups() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('bm_groups') || '[]');
+    _bmGroups = Array.isArray(saved) ? saved : [];
+  } catch(e) { _bmGroups = []; }
+  if (!_bmGroups.length) _bmGroups = [{ name:'', appToken:'', tableId:'', cozeToken:'', wf2:'', wf3:'', wf4:'' }];
+  bmRenderGroups();
+}
+
+// ── 读取当前输入框值（input value 可能和 _bmGroups 有延迟）──
+function bmCollectGroups() {
+  const cards = document.querySelectorAll('#bm-groups-list [data-bm-idx]');
+  const groups = [];
+  cards.forEach((card, i) => {
+    const inputs = card.querySelectorAll('input');
+    groups.push({
+      name:       inputs[0].value.trim(),
+      cozeToken:  inputs[1].value.trim(),
+      appToken:   inputs[2].value.trim(),
+      tableId:    inputs[3].value.trim(),
+      wf2:        inputs[4].value.trim(),
+      wf3:        inputs[5].value.trim(),
+      wf4:        inputs[6].value.trim(),
+    });
+  });
+  return groups;
+}
+
+// ── 启动 / 停止 ──
+function bmStartAll() {
+  const groups = bmCollectGroups();
+  if (!groups.length) { alert('请先添加至少一个监控组'); return; }
   fetch('/api/bitable/start', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ wf2_id: wf2, wf3_id: wf3, wf4_id: wf4 }),
+    body: JSON.stringify({ groups: groups }),
   }).then(r => r.json()).then(d => {
     if (d.ok) {
-      bmSetRunning(true);
-      bmPollStatus();
+      bmSetGlobalBadge(true);
+      bmStartPoll();
     } else {
-      alert('启动失败: ' + (d.msg || '未知错误'));
+      alert('启动失败: ' + (d.msg || '未知'));
     }
-  }).catch(e => alert('请求失败: ' + e));
+  }).catch(e => alert('网络错误: ' + e));
 }
 
-function bmStop() {
+function bmStopAll() {
   fetch('/api/bitable/stop', { method: 'POST' })
-    .then(r => r.json()).then(d => {
-      bmSetRunning(false);
-      if (_bmPollTimer) { clearInterval(_bmPollTimer); _bmPollTimer = null; }
-    }).catch(e => console.warn('stop error', e));
+    .then(r => r.json())
+    .then(() => { bmSetGlobalBadge(false); if (_bmPollTimer) { clearInterval(_bmPollTimer); _bmPollTimer = null; } })
+    .catch(e => console.warn('stop err', e));
 }
 
-function bmSetRunning(running) {
-  const btnStart = document.getElementById('bm-btn-start');
-  const btnStop  = document.getElementById('bm-btn-stop');
-  const badge    = document.getElementById('bm-status-badge');
-  btnStart.disabled = running;
-  btnStop.disabled  = !running;
-  btnStart.style.background = running ? '#94a3b8' : 'linear-gradient(135deg,#0ea5e9,#0284c7)';
+function bmSetGlobalBadge(running) {
+  const badge = document.getElementById('bm-global-badge');
+  if (!badge) return;
   badge.textContent = running ? '🟢 运行中' : '⚪ 未运行';
   badge.style.background = running ? '#dcfce7' : '#f1f5f9';
   badge.style.color      = running ? '#15803d' : '#64748b';
 }
 
-function bmPollStatus() {
+function bmStartPoll() {
   if (_bmPollTimer) clearInterval(_bmPollTimer);
   _bmPollTimer = setInterval(() => {
     fetch('/api/bitable/status').then(r => r.json()).then(d => {
-      // 更新状态按钮
-      bmSetRunning(d.running);
-      if (!d.running && _bmPollTimer) {
-        clearInterval(_bmPollTimer); _bmPollTimer = null;
-      }
-      // 统计
+      bmSetGlobalBadge(d.running);
+      if (!d.running) { clearInterval(_bmPollTimer); _bmPollTimer = null; }
       const s = d.stats || {};
-      document.getElementById('bm-stat2').textContent    = s.stage2 || 0;
-      document.getElementById('bm-stat3').textContent    = s.stage3 || 0;
-      document.getElementById('bm-stat4').textContent    = s.stage4 || 0;
-      document.getElementById('bm-stat-err').textContent = s.errors || 0;
-      // 日志
-      const logEl = document.getElementById('bm-log');
-      const logs  = d.logs || [];
-      if (logs.length) {
-        logEl.textContent = logs.join('\\n');
-        logEl.scrollTop   = logEl.scrollHeight;
-      }
-    }).catch(e => console.warn('bm poll error', e));
+      const el = id => document.getElementById(id);
+      if (el('bm-tot2')) el('bm-tot2').textContent = s.stage2 || 0;
+      if (el('bm-tot3')) el('bm-tot3').textContent = s.stage3 || 0;
+      if (el('bm-tot4')) el('bm-tot4').textContent = s.stage4 || 0;
+      if (el('bm-tot-err')) el('bm-tot-err').textContent = s.errors || 0;
+      const logEl = el('bm-log');
+      const logs = d.logs || [];
+      if (logEl && logs.length) { logEl.textContent = logs.join('\\n'); logEl.scrollTop = logEl.scrollHeight; }
+    }).catch(e => console.warn('bm poll err', e));
   }, 2000);
 }
 
-// Workflow ID 自动保存到 localStorage
-function bmSaveWfIds() {
-  localStorage.setItem('bm_wf2', document.getElementById('bm-wf2').value);
-  localStorage.setItem('bm_wf3', document.getElementById('bm-wf3').value);
-  localStorage.setItem('bm_wf4', document.getElementById('bm-wf4').value);
-}
-function bmRestoreWfIds() {
-  const wf2 = localStorage.getItem('bm_wf2');
-  const wf3 = localStorage.getItem('bm_wf3');
-  const wf4 = localStorage.getItem('bm_wf4');
-  if (wf2) document.getElementById('bm-wf2').value = wf2;
-  if (wf3) document.getElementById('bm-wf3').value = wf3;
-  if (wf4) document.getElementById('bm-wf4').value = wf4;
-}
 window.addEventListener('DOMContentLoaded', () => {
-  bmRestoreWfIds();
-  // 检查监控是否已在运行（页面刷新后恢复状态）
+  bmLoadGroups();
   fetch('/api/bitable/status').then(r => r.json()).then(d => {
-    if (d.running) { bmSetRunning(true); bmPollStatus(); }
+    if (d.running) { bmSetGlobalBadge(true); bmStartPoll(); }
   }).catch(() => {});
 });
 
@@ -5697,9 +5757,9 @@ def _bitable_update_record(token: str, app_token: str, table_id: str, record_id:
     if data.get("code") != 0:
         raise RuntimeError(f"写回失败: {data}")
 
-def _call_coze_workflow(workflow_id: str, params: dict) -> dict:
-    """调用 Coze 工作流，返回 output 字典"""
-    token = os.getenv("COZE_TOKEN_1", "")
+def _call_coze_workflow(workflow_id: str, params: dict, coze_token: str = "") -> dict:
+    """调用 Coze 工作流，返回 output 字典。coze_token 优先于环境变量"""
+    token = coze_token or os.getenv("COZE_TOKEN_1", "")
     base_url = os.getenv("COZE_BASE_URL", "https://api.coze.cn")
     resp = requests.post(
         f"{base_url}/v1/workflow/run",
@@ -5726,181 +5786,157 @@ def _get_field(record: dict, field_name: str) -> str:
         return "".join(v.get("text", "") for v in val if isinstance(v, dict))
     return str(val) if val is not None else ""
 
-def _bitable_monitor_loop():
-    """监控主循环，每2秒扫一次表格"""
-    global _bitable_monitor_stats
-    app_token  = os.getenv("BITABLE_APP_TOKEN", "")
-    table_id   = os.getenv("BITABLE_TABLE_ID", "")
-    wf2_id     = os.getenv("WORKFLOW2_ID", "")
-    wf3_id     = os.getenv("WORKFLOW3_ID", "")
-    wf4_id     = os.getenv("WORKFLOW4_ID", "")
+_bitable_monitor_configs = []   # 由 /api/bitable/start 写入的监控组列表
 
-    if not all([app_token, table_id]):
-        _bitable_log("❌ 缺少 BITABLE_APP_TOKEN 或 BITABLE_TABLE_ID，请检查配置")
+def _bitable_monitor_one_group(group: dict, executor, in_progress: set, tk_cache: dict):
+    """处理单个监控组的一轮扫描"""
+    app_token  = group.get("appToken", "").strip()
+    table_id   = group.get("tableId", "").strip()
+    wf2_id     = group.get("wf2", "").strip()
+    wf3_id     = group.get("wf3", "").strip()
+    wf4_id     = group.get("wf4", "").strip()
+    coze_token = group.get("cozeToken", "").strip()
+    label      = group.get("name", "") or app_token[:8]
+
+    if not app_token or not table_id:
         return
 
+    import time
+    # 飞书 token 缓存（按 app_id+secret 共用，因为是同一个自建应用）
+    if time.time() > tk_cache.get("expire", 0) - 60:
+        tk_cache["val"]    = _get_feishu_token()
+        tk_cache["expire"] = time.time() + 7000
+    tk = tk_cache["val"]
+
     test_mode = not any([wf2_id, wf3_id, wf4_id])
-    if test_mode:
-        _bitable_log("🔍 [诊断模式] 未配置工作流ID，只读取字段，不触发工作流")
-    else:
-        _bitable_log(f"✅ 监控已启动，每2秒扫描一次")
-        _bitable_log(f"   阶段2(生图): {'✅ ' + wf2_id[:12] + '...' if wf2_id else '⏭ 未配置'}")
-        _bitable_log(f"   阶段3(生视频): {'✅ ' + wf3_id[:12] + '...' if wf3_id else '⏭ 未配置'}")
-        _bitable_log(f"   阶段4(加字幕): {'✅ ' + wf4_id[:12] + '...' if wf4_id else '⏭ 未配置'}")
 
-    _feishu_token = {"val": "", "expire": 0}
-    _diag_done = False  # 诊断模式只打印一次详细字段
+    try:
+        records = _bitable_list_records(tk, app_token, table_id)
+    except Exception as e:
+        _bitable_log(f"❌ [{label}] 拉取记录失败: {e}")
+        return
 
-    def get_token():
-        import time
-        if time.time() > _feishu_token["expire"] - 60:
-            _feishu_token["val"] = _get_feishu_token()
-            _feishu_token["expire"] = time.time() + 7000
-        return _feishu_token["val"]
+    # 诊断模式：只在该组第一次扫描时输出
+    if test_mode and not group.get("_diag_done"):
+        group["_diag_done"] = True
+        _bitable_log(f"🔍 [{label}] 诊断模式，共 {len(records)} 条记录")
+        WATCH = ["生图提示词", "图片url", "启动视频", "视频提示词", "比例", "字幕", "视频生成", "时长"]
+        cnt2 = cnt3 = cnt4 = 0
+        for i, rec in enumerate(records[:3]):
+            _bitable_log(f"  记录{i+1} [{rec['record_id'][:8]}]:")
+            for fn in WATCH:
+                fval = _get_field(rec, fn)
+                disp = (fval[:35] + "…") if len(fval) > 35 else fval
+                _bitable_log(f"    {'✅' if fval else '○'} {fn}: {disp or '(空)'}")
+        for rec in records:
+            f = lambda n, r=rec: _get_field(r, n)
+            if f("生图提示词") and f("比例") and not f("图片url"):     cnt2 += 1
+            elif f("图片url") and f("启动视频") == "1" and not f("视频生成"): cnt3 += 1
+            elif f("视频生成") and f("字幕") and not f("视频url"):     cnt4 += 1
+        _bitable_log(f"  📊 待生图:{cnt2} 待生视频:{cnt3} 待加字幕:{cnt4}")
+        _bitable_log(f"  ✅ [{label}] 诊断完成")
+        return
 
-    executor = _futures.ThreadPoolExecutor(max_workers=20)
-    in_progress = set()  # 正在处理的 record_id，防止重复触发
+    # 正式扫描
+    tasks2, tasks3, tasks4 = [], [], []
+    for rec in records:
+        rid = rec["record_id"]
+        if rid in in_progress:
+            continue
+        f = lambda n, r=rec: _get_field(r, n)
+        if wf2_id and f("生图提示词") and f("比例") and not f("图片url"):
+            tasks2.append(rec)
+        elif wf3_id and f("图片url") and f("启动视频") == "1" and not f("视频生成"):
+            tasks3.append(rec)
+        elif wf4_id and f("视频生成") and f("字幕") and not f("视频url"):
+            tasks4.append(rec)
+
+    def run_stage2(rec):
+        rid = rec["record_id"]
+        in_progress.add(rid)
+        try:
+            f = lambda n: _get_field(rec, n)
+            _bitable_log(f"🎨 [{label}] 生图 {rid[:8]}…")
+            result = _call_coze_workflow(wf2_id, {"生图提示词": f("生图提示词"), "比例": f("比例")},
+                                         coze_token=coze_token)
+            url = result.get("图片url") or result.get("url") or result.get("image_url", "")
+            if url:
+                _bitable_update_record(tk, app_token, table_id, rid, {"图片url": url})
+                _bitable_log(f"✅ [{label}] 生图完成 {rid[:8]}")
+                with _bitable_monitor_lock: _bitable_monitor_stats["stage2"] += 1
+            else:
+                _bitable_log(f"⚠️ [{label}] 生图无url {rid[:8]} {result}")
+        except Exception as e:
+            _bitable_log(f"❌ [{label}] 生图失败 {rid[:8]}: {e}")
+            with _bitable_monitor_lock: _bitable_monitor_stats["errors"] += 1
+        finally:
+            in_progress.discard(rid)
+
+    def run_stage3(rec):
+        rid = rec["record_id"]
+        in_progress.add(rid)
+        try:
+            f = lambda n: _get_field(rec, n)
+            _bitable_log(f"🎬 [{label}] 生视频 {rid[:8]}…")
+            result = _call_coze_workflow(wf3_id, {"图片url": f("图片url"), "比例": f("比例"), "视频提示词": f("视频提示词")},
+                                         coze_token=coze_token)
+            url = result.get("视频url") or result.get("url") or result.get("video_url", "")
+            if url:
+                _bitable_update_record(tk, app_token, table_id, rid, {"视频生成": url})
+                _bitable_log(f"✅ [{label}] 生视频完成 {rid[:8]}")
+                with _bitable_monitor_lock: _bitable_monitor_stats["stage3"] += 1
+            else:
+                _bitable_log(f"⚠️ [{label}] 生视频无url {rid[:8]} {result}")
+        except Exception as e:
+            _bitable_log(f"❌ [{label}] 生视频失败 {rid[:8]}: {e}")
+            with _bitable_monitor_lock: _bitable_monitor_stats["errors"] += 1
+        finally:
+            in_progress.discard(rid)
+
+    def run_stage4(rec):
+        rid = rec["record_id"]
+        in_progress.add(rid)
+        try:
+            f = lambda n: _get_field(rec, n)
+            _bitable_log(f"📝 [{label}] 加字幕 {rid[:8]}…")
+            result = _call_coze_workflow(wf4_id, {"视频url": f("视频生成"), "字幕": f("字幕")},
+                                         coze_token=coze_token)
+            url = result.get("视频url") or result.get("url") or result.get("video_url", "")
+            if url:
+                _bitable_update_record(tk, app_token, table_id, rid, {"视频url": url})
+                _bitable_log(f"✅ [{label}] 加字幕完成 {rid[:8]}")
+                with _bitable_monitor_lock: _bitable_monitor_stats["stage4"] += 1
+            else:
+                _bitable_log(f"⚠️ [{label}] 加字幕无url {rid[:8]} {result}")
+        except Exception as e:
+            _bitable_log(f"❌ [{label}] 加字幕失败 {rid[:8]}: {e}")
+            with _bitable_monitor_lock: _bitable_monitor_stats["errors"] += 1
+        finally:
+            in_progress.discard(rid)
+
+    for rec in tasks2: executor.submit(run_stage2, rec)
+    for rec in tasks3: executor.submit(run_stage3, rec)
+    for rec in tasks4: executor.submit(run_stage4, rec)
+    if tasks2 or tasks3 or tasks4:
+        _bitable_log(f"📊 [{label}] 生图{len(tasks2)} 生视频{len(tasks3)} 字幕{len(tasks4)}")
+
+
+def _bitable_monitor_loop():
+    """监控主循环，每2秒轮询所有监控组"""
+    global _bitable_monitor_stats
+    import time
+    _bitable_log(f"✅ 监控已启动，共 {len(_bitable_monitor_configs)} 个监控组")
+    executor    = _futures.ThreadPoolExecutor(max_workers=30)
+    in_progress = set()
+    tk_cache    = {"val": "", "expire": 0}
 
     while _bitable_monitor_running:
-        try:
-            tk = get_token()
-            records = _bitable_list_records(tk, app_token, table_id)
-
-            if test_mode and not _diag_done:
-                _diag_done = True
-                _bitable_log(f"📋 共读取到 {len(records)} 条记录")
-                WATCH_FIELDS = ["生图提示词", "图片url", "启动视频", "视频提示词", "比例", "字幕", "视频生成", "时长"]
-                cnt2 = cnt3 = cnt4 = 0
-                for i, rec in enumerate(records[:5]):   # 最多展示前5条
-                    fv = {fn: _get_field(rec, fn) for fn in WATCH_FIELDS}
-                    _bitable_log(f"  记录{i+1} [{rec['record_id'][:8]}]:")
-                    for fn, fval in fv.items():
-                        display = (fval[:40] + "…") if len(fval) > 40 else fval
-                        status = "✅" if fval else "○"
-                        _bitable_log(f"    {status} {fn}: {display or '(空)'}")
-                # 统计各阶段匹配数
-                for rec in records:
-                    f = lambda name, r=rec: _get_field(r, name)
-                    if f("生图提示词") and f("比例") and not f("图片url"):
-                        cnt2 += 1
-                    elif f("图片url") and f("启动视频") == "1" and not f("视频生成"):
-                        cnt3 += 1
-                    elif f("视频生成") and f("字幕") and not f("视频url"):
-                        cnt4 += 1
-                _bitable_log(f"📊 符合阶段2(待生图): {cnt2} 条")
-                _bitable_log(f"📊 符合阶段3(待生视频): {cnt3} 条")
-                _bitable_log(f"📊 符合阶段4(待加字幕): {cnt4} 条")
-                _bitable_log("✅ 诊断完成，可停止监控或填入工作流ID后重新启动")
-
-            tasks2, tasks3, tasks4 = [], [], []
-            for rec in records:
-                rid = rec["record_id"]
-                if rid in in_progress:
-                    continue
-                f = lambda name, r=rec: _get_field(r, name)
-
-                # 阶段2：有生图提示词+比例，但图片URL为空
-                if wf2_id and f("生图提示词") and f("比例") and not f("图片url"):
-                    tasks2.append(rec)
-
-                # 阶段3：有图片URL + 启动视频=1，但视频URL为空
-                elif wf3_id and f("图片url") and f("启动视频") == "1" and not f("视频生成"):
-                    tasks3.append(rec)
-
-                # 阶段4：有视频URL + 字幕，但字幕视频URL为空
-                elif wf4_id and f("视频生成") and f("字幕") and not f("视频url"):
-                    tasks4.append(rec)
-
-            def run_stage2(rec):
-                rid = rec["record_id"]
-                in_progress.add(rid)
-                try:
-                    f = lambda name: _get_field(rec, name)
-                    _bitable_log(f"🎨 生图 record={rid[:8]}...")
-                    result = _call_coze_workflow(wf2_id, {
-                        "生图提示词": f("生图提示词"),
-                        "比例": f("比例"),
-                    })
-                    img_url = result.get("图片url") or result.get("url") or result.get("image_url", "")
-                    if img_url:
-                        _bitable_update_record(tk, app_token, table_id, rid, {"图片url": img_url})
-                        _bitable_log(f"✅ 生图完成 record={rid[:8]}")
-                        with _bitable_monitor_lock:
-                            _bitable_monitor_stats["stage2"] += 1
-                    else:
-                        _bitable_log(f"⚠️ 生图结果无url record={rid[:8]} result={result}")
-                except Exception as e:
-                    _bitable_log(f"❌ 生图失败 record={rid[:8]}: {e}")
-                    with _bitable_monitor_lock:
-                        _bitable_monitor_stats["errors"] += 1
-                finally:
-                    in_progress.discard(rid)
-
-            def run_stage3(rec):
-                rid = rec["record_id"]
-                in_progress.add(rid)
-                try:
-                    f = lambda name: _get_field(rec, name)
-                    _bitable_log(f"🎬 生视频 record={rid[:8]}...")
-                    result = _call_coze_workflow(wf3_id, {
-                        "图片url": f("图片url"),
-                        "比例": f("比例"),
-                        "视频提示词": f("视频提示词"),
-                    })
-                    vid_url = result.get("视频url") or result.get("url") or result.get("video_url", "")
-                    if vid_url:
-                        _bitable_update_record(tk, app_token, table_id, rid, {"视频生成": vid_url})
-                        _bitable_log(f"✅ 生视频完成 record={rid[:8]}")
-                        with _bitable_monitor_lock:
-                            _bitable_monitor_stats["stage3"] += 1
-                    else:
-                        _bitable_log(f"⚠️ 生视频结果无url record={rid[:8]} result={result}")
-                except Exception as e:
-                    _bitable_log(f"❌ 生视频失败 record={rid[:8]}: {e}")
-                    with _bitable_monitor_lock:
-                        _bitable_monitor_stats["errors"] += 1
-                finally:
-                    in_progress.discard(rid)
-
-            def run_stage4(rec):
-                rid = rec["record_id"]
-                in_progress.add(rid)
-                try:
-                    f = lambda name: _get_field(rec, name)
-                    _bitable_log(f"📝 加字幕 record={rid[:8]}...")
-                    result = _call_coze_workflow(wf4_id, {
-                        "视频url": f("视频生成"),
-                        "字幕": f("字幕"),
-                    })
-                    final_url = result.get("视频url") or result.get("url") or result.get("video_url", "")
-                    if final_url:
-                        _bitable_update_record(tk, app_token, table_id, rid, {"视频url": final_url})
-                        _bitable_log(f"✅ 字幕完成 record={rid[:8]}")
-                        with _bitable_monitor_lock:
-                            _bitable_monitor_stats["stage4"] += 1
-                    else:
-                        _bitable_log(f"⚠️ 字幕结果无url record={rid[:8]} result={result}")
-                except Exception as e:
-                    _bitable_log(f"❌ 字幕失败 record={rid[:8]}: {e}")
-                    with _bitable_monitor_lock:
-                        _bitable_monitor_stats["errors"] += 1
-                finally:
-                    in_progress.discard(rid)
-
-            for rec in tasks2:
-                executor.submit(run_stage2, rec)
-            for rec in tasks3:
-                executor.submit(run_stage3, rec)
-            for rec in tasks4:
-                executor.submit(run_stage4, rec)
-
-            if tasks2 or tasks3 or tasks4:
-                _bitable_log(f"📊 本轮：生图{len(tasks2)} 生视频{len(tasks3)} 字幕{len(tasks4)}")
-
-        except Exception as e:
-            _bitable_log(f"❌ 扫描出错: {e}")
-
-        import time
+        for group in _bitable_monitor_configs:
+            try:
+                _bitable_monitor_one_group(group, executor, in_progress, tk_cache)
+            except Exception as e:
+                label = group.get("name", group.get("appToken", "?")[:8])
+                _bitable_log(f"❌ [{label}] 出错: {e}")
         time.sleep(2)
 
     _bitable_log("🛑 监控已停止")
@@ -5908,15 +5944,14 @@ def _bitable_monitor_loop():
 
 @app.route("/api/bitable/start", methods=["POST"])
 def bitable_start():
-    global _bitable_monitor_running, _bitable_monitor_thread
+    global _bitable_monitor_running, _bitable_monitor_thread, _bitable_monitor_configs
     if _bitable_monitor_running:
         return jsonify({"ok": False, "msg": "监控已在运行中"})
     body = request.get_json(silent=True) or {}
-    # 前端传来的 Workflow ID 覆盖环境变量（运行时生效，不写磁盘）
-    for key, env_key in [("wf2_id", "WORKFLOW2_ID"), ("wf3_id", "WORKFLOW3_ID"), ("wf4_id", "WORKFLOW4_ID")]:
-        val = (body.get(key) or "").strip()
-        if val:
-            os.environ[env_key] = val
+    groups = body.get("groups", [])
+    if not groups:
+        return jsonify({"ok": False, "msg": "未提供监控组配置"})
+    _bitable_monitor_configs = groups
     _bitable_monitor_running = True
     _bitable_monitor_thread = threading.Thread(target=_bitable_monitor_loop, daemon=True)
     _bitable_monitor_thread.start()
