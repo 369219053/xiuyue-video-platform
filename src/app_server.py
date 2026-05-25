@@ -5904,8 +5904,7 @@ def _bitable_monitor_one_group(group: dict, executor, in_progress: set, tk_cache
             f = lambda n, r=rec: _get_field(r, n)
             if wf2_id and f("生图提示词") and f("比例") and not f("图片url"):
                 tasks2.append(rec)
-            elif (wf3_id and f("视频提示词") and f("图片url") and f("比例") and f("启动视频")
-                  and not f("视频生成")):
+            elif wf3_id and f("启动视频") and f("图片url") and f("视频提示词") and f("比例"):
                 tasks3.append(rec)
             elif wf4_id and f("视频生成") and f("字幕") and not f("视频url"):
                 tasks4.append(rec)
@@ -5962,7 +5961,8 @@ def _bitable_monitor_one_group(group: dict, executor, in_progress: set, tk_cache
                     url = url[0]
                 url = str(url).strip() if url else ""
                 if url:
-                    _bitable_update_record(tk, app_token, tid, rid, {"视频生成": url})
+                    # 写入视频url，同时清空「启动视频」防止重复触发
+                    _bitable_update_record(tk, app_token, tid, rid, {"视频生成": url, "启动视频": ""})
                     _bitable_log(f"✅ [{label}][{tname}] 生视频完成 {rid[:8]} → {url[:60]}")
                     with _bitable_monitor_lock: _bitable_monitor_stats["stage3"] += 1
                 else:
