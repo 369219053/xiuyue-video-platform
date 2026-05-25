@@ -5904,7 +5904,8 @@ def _bitable_monitor_one_group(group: dict, executor, in_progress: set, tk_cache
             f = lambda n, r=rec: _get_field(r, n)
             if wf2_id and f("生图提示词") and f("比例") and not f("图片url"):
                 tasks2.append(rec)
-            elif wf3_id and f("图片url") and f("启动视频") == "1" and not f("视频生成"):
+            elif (wf3_id and f("视频提示词") and f("图片url") and f("比例") and f("启动视频")
+                  and not f("视频生成")):
                 tasks3.append(rec)
             elif wf4_id and f("视频生成") and f("字幕") and not f("视频url"):
                 tasks4.append(rec)
@@ -5943,16 +5944,29 @@ def _bitable_monitor_one_group(group: dict, executor, in_progress: set, tk_cache
             in_progress.add(rid)
             try:
                 f = lambda n: _get_field(rec, n)
-                _bitable_log(f"🎬 [{label}][{tname}] 生视频 {rid[:8]}…")
-                result = _call_coze_workflow(wf3_id, {"图片url": f("图片url"), "比例": f("比例"), "视频提示词": f("视频提示词")},
-                                             coze_token=coze_token)
-                url = result.get("视频url") or result.get("url") or result.get("video_url", "")
+                img_url = f("图片url")
+                ratio   = f("比例")
+                prompt  = f("视频提示词")
+                qidong  = f("启动视频")
+                _bitable_log(f"🎬 [{label}][{tname}] 生视频 {rid[:8]} ratio={ratio} qidong={qidong}")
+                result = _call_coze_workflow(wf3_id, {
+                    "url":    img_url,
+                    "ratio":  ratio,
+                    "prompt": prompt,
+                    "qidong": qidong,
+                }, coze_token=coze_token)
+                _bitable_log(f"  工作流返回: {str(result)[:200]}")
+                url = (result.get("视频url") or result.get("video_url") or
+                       result.get("url") or result.get("output") or "")
+                if isinstance(url, list) and url:
+                    url = url[0]
+                url = str(url).strip() if url else ""
                 if url:
                     _bitable_update_record(tk, app_token, tid, rid, {"视频生成": url})
-                    _bitable_log(f"✅ [{label}][{tname}] 生视频完成 {rid[:8]}")
+                    _bitable_log(f"✅ [{label}][{tname}] 生视频完成 {rid[:8]} → {url[:60]}")
                     with _bitable_monitor_lock: _bitable_monitor_stats["stage3"] += 1
                 else:
-                    _bitable_log(f"⚠️ [{label}][{tname}] 生视频无url {rid[:8]} {result}")
+                    _bitable_log(f"⚠️ [{label}][{tname}] 生视频无url {rid[:8]}，完整返回: {result}")
             except Exception as e:
                 _bitable_log(f"❌ [{label}][{tname}] 生视频失败 {rid[:8]}: {e}")
                 with _bitable_monitor_lock: _bitable_monitor_stats["errors"] += 1
