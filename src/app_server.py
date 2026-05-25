@@ -5978,16 +5978,27 @@ def _bitable_monitor_one_group(group: dict, executor, in_progress: set, tk_cache
             in_progress.add(rid)
             try:
                 f = lambda n: _get_field(rec, n)
-                _bitable_log(f"📝 [{label}][{tname}] 加字幕 {rid[:8]}…")
-                result = _call_coze_workflow(wf4_id, {"视频url": f("视频生成"), "字幕": f("字幕")},
-                                             coze_token=coze_token)
-                url = result.get("视频url") or result.get("url") or result.get("video_url", "")
+                video_url = f("视频生成")
+                ratio     = f("比例")
+                zimu      = f("字幕")
+                _bitable_log(f"📝 [{label}][{tname}] 加字幕 {rid[:8]} ratio={ratio}")
+                result = _call_coze_workflow(wf4_id, {
+                    "input": video_url,
+                    "ratio": ratio,
+                    "zimu":  zimu,
+                }, coze_token=coze_token)
+                _bitable_log(f"  工作流返回: {str(result)[:200]}")
+                url = (result.get("视频url") or result.get("video_url") or
+                       result.get("url") or result.get("output") or "")
+                if isinstance(url, list) and url:
+                    url = url[0]
+                url = str(url).strip() if url else ""
                 if url:
                     _bitable_update_record(tk, app_token, tid, rid, {"视频url": url})
-                    _bitable_log(f"✅ [{label}][{tname}] 加字幕完成 {rid[:8]}")
+                    _bitable_log(f"✅ [{label}][{tname}] 加字幕完成 {rid[:8]} → {url[:60]}")
                     with _bitable_monitor_lock: _bitable_monitor_stats["stage4"] += 1
                 else:
-                    _bitable_log(f"⚠️ [{label}][{tname}] 加字幕无url {rid[:8]} {result}")
+                    _bitable_log(f"⚠️ [{label}][{tname}] 加字幕无url {rid[:8]}，完整返回: {result}")
             except Exception as e:
                 _bitable_log(f"❌ [{label}][{tname}] 加字幕失败 {rid[:8]}: {e}")
                 with _bitable_monitor_lock: _bitable_monitor_stats["errors"] += 1
