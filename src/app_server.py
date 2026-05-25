@@ -5800,6 +5800,7 @@ def _call_coze_workflow(workflow_id: str, params: dict, coze_token: str = "") ->
     """调用 Coze 工作流，返回 output 字典。coze_token 优先于环境变量"""
     token = coze_token or os.getenv("COZE_TOKEN_1", "")
     base_url = os.getenv("COZE_BASE_URL", "https://api.coze.cn")
+    _bitable_log(f"  [Coze] token={token[:12]}… wf={workflow_id} params={list(params.keys())}")
     resp = requests.post(
         f"{base_url}/v1/workflow/run",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -5916,7 +5917,7 @@ def _bitable_monitor_one_group(group: dict, executor, in_progress: set, tk_cache
                 prompt = f("生图提示词")
                 ratio  = f("比例")
                 _bitable_log(f"🎨 [{label}][{tname}] 生图 {rid[:8]} 提示词={prompt[:20]}… 比例={ratio}")
-                result = _call_coze_workflow(wf2_id, {"生图提示词": prompt, "比例": ratio},
+                result = _call_coze_workflow(wf2_id, {"input": prompt, "ratio": ratio},
                                              coze_token=coze_token)
                 _bitable_log(f"  工作流返回: {str(result)[:200]}")
                 # 兼容多种返回字段名
