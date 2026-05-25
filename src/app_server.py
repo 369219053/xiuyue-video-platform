@@ -5548,31 +5548,27 @@ function bmGroupHTML(g, i) {
     + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">'
     +   '<div><label style="' + lbStyle + '">别名（选填）</label>'
     +     '<input style="' + inStyle + '" placeholder="如：刘原原组" value="' + (g.name||'') + '"'
-    +     ' oninput="bmGroupChange(' + i + ',this,\'name\')">'
+    +     ' oninput="bmGroupChange(' + i + ',this,&quot;name&quot;)">'
     +   '</div>'
     +   '<div><label style="' + lbStyle + '">Coze Token</label>'
     +     '<input style="' + inStyle + '" placeholder="sat_..." value="' + (g.cozeToken||'') + '"'
-    +     ' oninput="bmGroupChange(' + i + ',this,\'cozeToken\')">'
+    +     ' oninput="bmGroupChange(' + i + ',this,&quot;cozeToken&quot;)">'
     +   '</div>'
-    +   '<div><label style="' + lbStyle + '">多维表格 Base Token</label>'
-    +     '<input style="' + inStyle + '" placeholder="NMwjbb..." value="' + (g.appToken||'') + '"'
-    +     ' oninput="bmGroupChange(' + i + ',this,\'appToken\')">'
-    +   '</div>'
-    +   '<div><label style="' + lbStyle + '">Table ID</label>'
-    +     '<input style="' + inStyle + '" placeholder="tbl..." value="' + (g.tableId||'') + '"'
-    +     ' oninput="bmGroupChange(' + i + ',this,\'tableId\')">'
+    +   '<div style="grid-column:1/-1"><label style="' + lbStyle + '">多维表格 Base Token</label>'
+    +     '<input style="' + inStyle + '" placeholder="NMwjbb...（留空=使用全局配置）" value="' + (g.appToken||'') + '"'
+    +     ' oninput="bmGroupChange(' + i + ',this,&quot;appToken&quot;)">'
     +   '</div>'
     +   '<div><label style="' + lbStyle + '">阶段2 Workflow（生图）</label>'
     +     '<input style="' + inStyle + '" placeholder="7xxxxxxxxx（留空=跳过）" value="' + (g.wf2||'') + '"'
-    +     ' oninput="bmGroupChange(' + i + ',this,\'wf2\')">'
+    +     ' oninput="bmGroupChange(' + i + ',this,&quot;wf2&quot;)">'
     +   '</div>'
     +   '<div><label style="' + lbStyle + '">阶段3 Workflow（生视频）</label>'
     +     '<input style="' + inStyle + '" placeholder="7xxxxxxxxx（留空=跳过）" value="' + (g.wf3||'') + '"'
-    +     ' oninput="bmGroupChange(' + i + ',this,\'wf3\')">'
+    +     ' oninput="bmGroupChange(' + i + ',this,&quot;wf3&quot;)">'
     +   '</div>'
     +   '<div><label style="' + lbStyle + '">阶段4 Workflow（加字幕）</label>'
     +     '<input style="' + inStyle + '" placeholder="7xxxxxxxxx（留空=跳过）" value="' + (g.wf4||'') + '"'
-    +     ' oninput="bmGroupChange(' + i + ',this,\'wf4\')">'
+    +     ' oninput="bmGroupChange(' + i + ',this,&quot;wf4&quot;)">'
     +   '</div>'
     + '</div>'
     + '</div>';
@@ -5584,7 +5580,7 @@ function bmGroupChange(i, el, field) {
 }
 
 function bmAddGroup() {
-  _bmGroups.push({ name:'', appToken:'', tableId:'', cozeToken:'', wf2:'', wf3:'', wf4:'' });
+  _bmGroups.push({ name:'', appToken:'', cozeToken:'', wf2:'', wf3:'', wf4:'' });
   bmRenderGroups();
 }
 
@@ -5602,7 +5598,7 @@ function bmLoadGroups() {
     const saved = JSON.parse(localStorage.getItem('bm_groups') || '[]');
     _bmGroups = Array.isArray(saved) ? saved : [];
   } catch(e) { _bmGroups = []; }
-  if (!_bmGroups.length) _bmGroups = [{ name:'', appToken:'', tableId:'', cozeToken:'', wf2:'', wf3:'', wf4:'' }];
+  if (!_bmGroups.length) _bmGroups = [{ name:'', appToken:'', cozeToken:'', wf2:'', wf3:'', wf4:'' }];
   bmRenderGroups();
 }
 
@@ -5616,10 +5612,9 @@ function bmCollectGroups() {
       name:       inputs[0].value.trim(),
       cozeToken:  inputs[1].value.trim(),
       appToken:   inputs[2].value.trim(),
-      tableId:    inputs[3].value.trim(),
-      wf2:        inputs[4].value.trim(),
-      wf3:        inputs[5].value.trim(),
-      wf4:        inputs[6].value.trim(),
+      wf2:        inputs[3].value.trim(),
+      wf3:        inputs[4].value.trim(),
+      wf4:        inputs[5].value.trim(),
     });
   });
   return groups;
@@ -5723,6 +5718,18 @@ def _get_feishu_token() -> str:
         raise RuntimeError(f"获取飞书token失败: {data}")
     return data["tenant_access_token"]
 
+def _bitable_list_tables(token: str, app_token: str) -> list:
+    """获取多维表格下所有子表，返回 [{table_id, name}, ...]"""
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.get(
+        f"{_FEISHU_HOST_API}/open-apis/bitable/v1/apps/{app_token}/tables",
+        headers=headers, timeout=15
+    )
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"获取子表列表失败: {data}")
+    return data.get("data", {}).get("items", [])
+
 def _bitable_list_records(token: str, app_token: str, table_id: str) -> list:
     """拉取多维表格所有记录（自动翻页）"""
     records = []
@@ -5789,20 +5796,21 @@ def _get_field(record: dict, field_name: str) -> str:
 _bitable_monitor_configs = []   # 由 /api/bitable/start 写入的监控组列表
 
 def _bitable_monitor_one_group(group: dict, executor, in_progress: set, tk_cache: dict):
-    """处理单个监控组的一轮扫描"""
-    app_token  = group.get("appToken", "").strip()
-    table_id   = group.get("tableId", "").strip()
+    """处理单个监控组的一轮扫描（自动发现并遍历所有子表）"""
+    # appToken 优先用配置里填的，留空则用 .env 里的全局配置
+    app_token  = (group.get("appToken") or "").strip() or os.getenv("BITABLE_APP_TOKEN", "")
     wf2_id     = group.get("wf2", "").strip()
     wf3_id     = group.get("wf3", "").strip()
     wf4_id     = group.get("wf4", "").strip()
     coze_token = group.get("cozeToken", "").strip()
     label      = group.get("name", "") or app_token[:8]
 
-    if not app_token or not table_id:
+    if not app_token:
+        _bitable_log(f"⚠️ [{label}] 未配置 Base Token，跳过")
         return
 
     import time
-    # 飞书 token 缓存（按 app_id+secret 共用，因为是同一个自建应用）
+    # 飞书 tenant_access_token 缓存
     if time.time() > tk_cache.get("expire", 0) - 60:
         tk_cache["val"]    = _get_feishu_token()
         tk_cache["expire"] = time.time() + 7000
@@ -5810,115 +5818,132 @@ def _bitable_monitor_one_group(group: dict, executor, in_progress: set, tk_cache
 
     test_mode = not any([wf2_id, wf3_id, wf4_id])
 
+    # ── 自动获取所有子表 ──
     try:
-        records = _bitable_list_records(tk, app_token, table_id)
+        tables = _bitable_list_tables(tk, app_token)
     except Exception as e:
-        _bitable_log(f"❌ [{label}] 拉取记录失败: {e}")
+        _bitable_log(f"❌ [{label}] 获取子表列表失败: {e}")
         return
 
-    # 诊断模式：只在该组第一次扫描时输出
+    if not tables:
+        _bitable_log(f"⚠️ [{label}] 该 Base 下没有子表")
+        return
+
+    # 诊断模式：首次输出所有子表名 + 字段预览
     if test_mode and not group.get("_diag_done"):
         group["_diag_done"] = True
-        _bitable_log(f"🔍 [{label}] 诊断模式，共 {len(records)} 条记录")
-        WATCH = ["生图提示词", "图片url", "启动视频", "视频提示词", "比例", "字幕", "视频生成", "时长"]
-        cnt2 = cnt3 = cnt4 = 0
-        for i, rec in enumerate(records[:3]):
-            _bitable_log(f"  记录{i+1} [{rec['record_id'][:8]}]:")
-            for fn in WATCH:
-                fval = _get_field(rec, fn)
-                disp = (fval[:35] + "…") if len(fval) > 35 else fval
-                _bitable_log(f"    {'✅' if fval else '○'} {fn}: {disp or '(空)'}")
-        for rec in records:
-            f = lambda n, r=rec: _get_field(r, n)
-            if f("生图提示词") and f("比例") and not f("图片url"):     cnt2 += 1
-            elif f("图片url") and f("启动视频") == "1" and not f("视频生成"): cnt3 += 1
-            elif f("视频生成") and f("字幕") and not f("视频url"):     cnt4 += 1
-        _bitable_log(f"  📊 待生图:{cnt2} 待生视频:{cnt3} 待加字幕:{cnt4}")
-        _bitable_log(f"  ✅ [{label}] 诊断完成")
+        _bitable_log(f"🔍 [{label}] 诊断模式，共发现 {len(tables)} 个子表：")
+        for t in tables:
+            _bitable_log(f"  📋 {t.get('name','?')}  (id: {t.get('table_id','?')})")
+        # 读第一个子表的前3条记录做字段预览
+        try:
+            first_id   = tables[0]["table_id"]
+            first_name = tables[0].get("name", first_id)
+            records = _bitable_list_records(tk, app_token, first_id)
+            _bitable_log(f"  [预览子表: {first_name}] 共 {len(records)} 条记录")
+            WATCH = ["生图提示词", "图片url", "启动视频", "视频提示词", "比例", "字幕", "视频生成", "时长"]
+            for i, rec in enumerate(records[:3]):
+                _bitable_log(f"  记录{i+1} [{rec['record_id'][:8]}]:")
+                for fn in WATCH:
+                    fval = _get_field(rec, fn)
+                    disp = (fval[:35] + "…") if len(fval) > 35 else fval
+                    _bitable_log(f"    {'✅' if fval else '○'} {fn}: {disp or '(空)'}")
+        except Exception as e:
+            _bitable_log(f"  ⚠️ 字段预览失败: {e}")
+        _bitable_log(f"  ✅ [{label}] 诊断完成，可填入工作流ID后重启监控")
         return
 
-    # 正式扫描
-    tasks2, tasks3, tasks4 = [], [], []
-    for rec in records:
-        rid = rec["record_id"]
-        if rid in in_progress:
+    # ── 正式扫描：逐个子表处理 ──
+    for table in tables:
+        table_id   = table["table_id"]
+        table_name = table.get("name", table_id)
+        try:
+            records = _bitable_list_records(tk, app_token, table_id)
+        except Exception as e:
+            _bitable_log(f"❌ [{label}][{table_name}] 拉取记录失败: {e}")
             continue
-        f = lambda n, r=rec: _get_field(r, n)
-        if wf2_id and f("生图提示词") and f("比例") and not f("图片url"):
-            tasks2.append(rec)
-        elif wf3_id and f("图片url") and f("启动视频") == "1" and not f("视频生成"):
-            tasks3.append(rec)
-        elif wf4_id and f("视频生成") and f("字幕") and not f("视频url"):
-            tasks4.append(rec)
 
-    def run_stage2(rec):
-        rid = rec["record_id"]
-        in_progress.add(rid)
-        try:
-            f = lambda n: _get_field(rec, n)
-            _bitable_log(f"🎨 [{label}] 生图 {rid[:8]}…")
-            result = _call_coze_workflow(wf2_id, {"生图提示词": f("生图提示词"), "比例": f("比例")},
-                                         coze_token=coze_token)
-            url = result.get("图片url") or result.get("url") or result.get("image_url", "")
-            if url:
-                _bitable_update_record(tk, app_token, table_id, rid, {"图片url": url})
-                _bitable_log(f"✅ [{label}] 生图完成 {rid[:8]}")
-                with _bitable_monitor_lock: _bitable_monitor_stats["stage2"] += 1
-            else:
-                _bitable_log(f"⚠️ [{label}] 生图无url {rid[:8]} {result}")
-        except Exception as e:
-            _bitable_log(f"❌ [{label}] 生图失败 {rid[:8]}: {e}")
-            with _bitable_monitor_lock: _bitable_monitor_stats["errors"] += 1
-        finally:
-            in_progress.discard(rid)
+        tasks2, tasks3, tasks4 = [], [], []
+        for rec in records:
+            rid = rec["record_id"]
+            if rid in in_progress:
+                continue
+            f = lambda n, r=rec: _get_field(r, n)
+            if wf2_id and f("生图提示词") and f("比例") and not f("图片url"):
+                tasks2.append(rec)
+            elif wf3_id and f("图片url") and f("启动视频") == "1" and not f("视频生成"):
+                tasks3.append(rec)
+            elif wf4_id and f("视频生成") and f("字幕") and not f("视频url"):
+                tasks4.append(rec)
 
-    def run_stage3(rec):
-        rid = rec["record_id"]
-        in_progress.add(rid)
-        try:
-            f = lambda n: _get_field(rec, n)
-            _bitable_log(f"🎬 [{label}] 生视频 {rid[:8]}…")
-            result = _call_coze_workflow(wf3_id, {"图片url": f("图片url"), "比例": f("比例"), "视频提示词": f("视频提示词")},
-                                         coze_token=coze_token)
-            url = result.get("视频url") or result.get("url") or result.get("video_url", "")
-            if url:
-                _bitable_update_record(tk, app_token, table_id, rid, {"视频生成": url})
-                _bitable_log(f"✅ [{label}] 生视频完成 {rid[:8]}")
-                with _bitable_monitor_lock: _bitable_monitor_stats["stage3"] += 1
-            else:
-                _bitable_log(f"⚠️ [{label}] 生视频无url {rid[:8]} {result}")
-        except Exception as e:
-            _bitable_log(f"❌ [{label}] 生视频失败 {rid[:8]}: {e}")
-            with _bitable_monitor_lock: _bitable_monitor_stats["errors"] += 1
-        finally:
-            in_progress.discard(rid)
+        def run_stage2(rec, tid=table_id, tname=table_name):
+            rid = rec["record_id"]
+            in_progress.add(rid)
+            try:
+                f = lambda n: _get_field(rec, n)
+                _bitable_log(f"🎨 [{label}][{tname}] 生图 {rid[:8]}…")
+                result = _call_coze_workflow(wf2_id, {"生图提示词": f("生图提示词"), "比例": f("比例")},
+                                             coze_token=coze_token)
+                url = result.get("图片url") or result.get("url") or result.get("image_url", "")
+                if url:
+                    _bitable_update_record(tk, app_token, tid, rid, {"图片url": url})
+                    _bitable_log(f"✅ [{label}][{tname}] 生图完成 {rid[:8]}")
+                    with _bitable_monitor_lock: _bitable_monitor_stats["stage2"] += 1
+                else:
+                    _bitable_log(f"⚠️ [{label}][{tname}] 生图无url {rid[:8]} {result}")
+            except Exception as e:
+                _bitable_log(f"❌ [{label}][{tname}] 生图失败 {rid[:8]}: {e}")
+                with _bitable_monitor_lock: _bitable_monitor_stats["errors"] += 1
+            finally:
+                in_progress.discard(rid)
 
-    def run_stage4(rec):
-        rid = rec["record_id"]
-        in_progress.add(rid)
-        try:
-            f = lambda n: _get_field(rec, n)
-            _bitable_log(f"📝 [{label}] 加字幕 {rid[:8]}…")
-            result = _call_coze_workflow(wf4_id, {"视频url": f("视频生成"), "字幕": f("字幕")},
-                                         coze_token=coze_token)
-            url = result.get("视频url") or result.get("url") or result.get("video_url", "")
-            if url:
-                _bitable_update_record(tk, app_token, table_id, rid, {"视频url": url})
-                _bitable_log(f"✅ [{label}] 加字幕完成 {rid[:8]}")
-                with _bitable_monitor_lock: _bitable_monitor_stats["stage4"] += 1
-            else:
-                _bitable_log(f"⚠️ [{label}] 加字幕无url {rid[:8]} {result}")
-        except Exception as e:
-            _bitable_log(f"❌ [{label}] 加字幕失败 {rid[:8]}: {e}")
-            with _bitable_monitor_lock: _bitable_monitor_stats["errors"] += 1
-        finally:
-            in_progress.discard(rid)
+        def run_stage3(rec, tid=table_id, tname=table_name):
+            rid = rec["record_id"]
+            in_progress.add(rid)
+            try:
+                f = lambda n: _get_field(rec, n)
+                _bitable_log(f"🎬 [{label}][{tname}] 生视频 {rid[:8]}…")
+                result = _call_coze_workflow(wf3_id, {"图片url": f("图片url"), "比例": f("比例"), "视频提示词": f("视频提示词")},
+                                             coze_token=coze_token)
+                url = result.get("视频url") or result.get("url") or result.get("video_url", "")
+                if url:
+                    _bitable_update_record(tk, app_token, tid, rid, {"视频生成": url})
+                    _bitable_log(f"✅ [{label}][{tname}] 生视频完成 {rid[:8]}")
+                    with _bitable_monitor_lock: _bitable_monitor_stats["stage3"] += 1
+                else:
+                    _bitable_log(f"⚠️ [{label}][{tname}] 生视频无url {rid[:8]} {result}")
+            except Exception as e:
+                _bitable_log(f"❌ [{label}][{tname}] 生视频失败 {rid[:8]}: {e}")
+                with _bitable_monitor_lock: _bitable_monitor_stats["errors"] += 1
+            finally:
+                in_progress.discard(rid)
 
-    for rec in tasks2: executor.submit(run_stage2, rec)
-    for rec in tasks3: executor.submit(run_stage3, rec)
-    for rec in tasks4: executor.submit(run_stage4, rec)
-    if tasks2 or tasks3 or tasks4:
-        _bitable_log(f"📊 [{label}] 生图{len(tasks2)} 生视频{len(tasks3)} 字幕{len(tasks4)}")
+        def run_stage4(rec, tid=table_id, tname=table_name):
+            rid = rec["record_id"]
+            in_progress.add(rid)
+            try:
+                f = lambda n: _get_field(rec, n)
+                _bitable_log(f"📝 [{label}][{tname}] 加字幕 {rid[:8]}…")
+                result = _call_coze_workflow(wf4_id, {"视频url": f("视频生成"), "字幕": f("字幕")},
+                                             coze_token=coze_token)
+                url = result.get("视频url") or result.get("url") or result.get("video_url", "")
+                if url:
+                    _bitable_update_record(tk, app_token, tid, rid, {"视频url": url})
+                    _bitable_log(f"✅ [{label}][{tname}] 加字幕完成 {rid[:8]}")
+                    with _bitable_monitor_lock: _bitable_monitor_stats["stage4"] += 1
+                else:
+                    _bitable_log(f"⚠️ [{label}][{tname}] 加字幕无url {rid[:8]} {result}")
+            except Exception as e:
+                _bitable_log(f"❌ [{label}][{tname}] 加字幕失败 {rid[:8]}: {e}")
+                with _bitable_monitor_lock: _bitable_monitor_stats["errors"] += 1
+            finally:
+                in_progress.discard(rid)
+
+        for rec in tasks2: executor.submit(run_stage2, rec)
+        for rec in tasks3: executor.submit(run_stage3, rec)
+        for rec in tasks4: executor.submit(run_stage4, rec)
+        if tasks2 or tasks3 or tasks4:
+            _bitable_log(f"📊 [{label}][{table_name}] 生图{len(tasks2)} 生视频{len(tasks3)} 字幕{len(tasks4)}")
 
 
 def _bitable_monitor_loop():
