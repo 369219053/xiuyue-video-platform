@@ -13,8 +13,24 @@ import threading
 import uuid
 from pathlib import Path
 
+import requests
 import subprocess
 from urllib.parse import urlencode
+
+# 手动加载 .env 文件（不依赖 python-dotenv）
+def _load_env_file(path: str = ".env"):
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                os.environ.setdefault(key.strip(), val.strip())
+    except FileNotFoundError:
+        pass
+
+_load_env_file()
 
 import webview
 
