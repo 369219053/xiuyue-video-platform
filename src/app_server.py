@@ -5607,16 +5607,31 @@ function bmRemoveGroup(i) {
 }
 
 function bmSaveGroups() {
+  // 双写：localStorage 备份 + 后端文件持久化
   try { localStorage.setItem('bm_groups', JSON.stringify(_bmGroups)); } catch(e) {}
+  fetch('/api/bitable/save-groups', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ groups: _bmGroups }),
+  }).catch(() => {});
 }
 
 function bmLoadGroups() {
-  try {
-    const saved = JSON.parse(localStorage.getItem('bm_groups') || '[]');
-    _bmGroups = Array.isArray(saved) ? saved : [];
-  } catch(e) { _bmGroups = []; }
-  if (!_bmGroups.length) _bmGroups = [{ name:'', appToken:'', cozeToken:'', wf2:'', wf3:'', wf4:'' }];
-  bmRenderGroups();
+  // 优先从后端文件加载，失败时用 localStorage 兜底
+  fetch('/api/bitable/load-groups').then(r => r.json()).then(d => {
+    const saved = d.groups;
+    _bmGroups = (Array.isArray(saved) && saved.length) ? saved : [];
+    if (!_bmGroups.length) _bmGroups = [{ name:'', appToken:'', cozeToken:'', wf2:'', wf3:'', wf4:'' }];
+    bmRenderGroups();
+  }).catch(() => {
+    // 网络异常才降级到 localStorage
+    try {
+      const saved = JSON.parse(localStorage.getItem('bm_groups') || '[]');
+      _bmGroups = Array.isArray(saved) ? saved : [];
+    } catch(e) { _bmGroups = []; }
+    if (!_bmGroups.length) _bmGroups = [{ name:'', appToken:'', cozeToken:'', wf2:'', wf3:'', wf4:'' }];
+    bmRenderGroups();
+  });
 }
 
 // ── 读取当前输入框值（input value 可能和 _bmGroups 有延迟）──
@@ -6014,6 +6029,24 @@ def bitable_stop():
     _bitable_monitor_running = False
     return jsonify({"ok": True, "msg": "监控已停止"})
 
+
+_MONITOR_GROUPS_FILE = Path("data/bitable_monitor_groups.json")
+
+@app.route("/api/bitable/save-groups", methods=["POST"])
+def bitable_save_groups():
+    body = request.get_json(silent=True) or {}
+    groups = body.get("groups", [])
+    _MONITOR_GROUPS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _MONITOR_GROUPS_FILE.write_text(json.dumps(groups, ensure_ascii=False, indent=2), encoding="utf-8")
+    return jsonify({"ok": True})
+
+@app.route("/api/bitable/load-groups", methods=["GET"])
+def bitable_load_groups():
+    try:
+        groups = json.loads(_MONITOR_GROUPS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        groups = []
+    return jsonify({"groups": groups})
 
 @app.route("/api/bitable/status", methods=["GET"])
 def bitable_status():
