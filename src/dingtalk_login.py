@@ -14,7 +14,12 @@ import time
 import re
 from typing import Optional
 
-import webview
+# webview 仅在桌面模式下使用，云服务器无需安装
+try:
+    import webview
+    _WEBVIEW_AVAILABLE = True
+except ImportError:
+    _WEBVIEW_AVAILABLE = False
 
 from dingtalk_client import DingTalkSession
 
@@ -126,6 +131,12 @@ def open_login_window(session: Optional[DingTalkSession] = None) -> dict:
             window.destroy()
         except Exception:
             pass
+
+    # 服务器模式下无 webview，直接返回失败
+    if not _WEBVIEW_AVAILABLE:
+        with _login_lock:
+            _login_state["in_progress"] = False
+        return {"success": False, "message": "服务器模式下不支持扫码登录窗口", "dentry_key": "", "doc_key": ""}
 
     # 创建新窗口（pywebview 支持多窗口；主窗口已 webview.start()）
     win = webview.create_window(

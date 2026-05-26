@@ -359,6 +359,35 @@ def _classify_columns(headers: list) -> tuple:
     return text_group, visual_group, char_group
 
 
+
+def count_unique_text_rows(templates: list, header_str: str) -> int:
+    """统计模版行中唯一台词组合的数量（即"有几套不重复的台词"）。
+
+    只按"台词"列去重（排除"字幕"列），因为字幕是台词的校正版，
+    不同字幕但相同台词视为同一套。
+    - 有台词列（含"台词"且不含"字幕"的列）：按这些列组合去重计数
+    - 无台词列：返回去重后的总行数（整行视为台词）
+    """
+    if not templates:
+        return 0
+    headers = [h.strip() for h in header_str.split(' // ')]
+    # 只取含"台词"且不含"字幕"的列（排除"最终字幕的台词"这类）
+    lyric_idx = [i for i, h in enumerate(headers) if '台词' in h and '字幕' not in h]
+    if not lyric_idx:
+        # 兜底：用全部 text_group（含字幕）
+        text_idx, _, _ = _classify_columns(headers)
+        lyric_idx = text_idx
+    if not lyric_idx:
+        return len(set(templates))
+    seen = set()
+    for row_str in templates:
+        parts = row_str.split(' // ')
+        parts += ['/'] * (len(headers) - len(parts))
+        t = tuple(parts[i] if i < len(parts) else '/' for i in lyric_idx)
+        seen.add(t)
+    return len(seen)
+
+
 # 时长列兜底常量
 _DEFAULT_DURATION = '10'
 _DURATION_RE = _re.compile(r'^\d+(?:\.\d+)?$')
@@ -418,6 +447,27 @@ def _random_combine(templates: list, header_str: str, count: int, seed: int = No
     # 构建颜色池：仅来自原模版人物列（方案 A — 安全的）
     color_pool = _extract_color_pool(char_texts)
 
+    # 台词队列：只按"台词"列（不含"字幕"列）去重，字幕不同但台词相同视为同一套
+    # → 保证生成的前 K 条（K = 唯一台词数）各有不同台词，超出后再随机
+    # lyric_idx_local：text_idx 中仅含"台词"且不含"字幕"的列（用于去重 key）
+    lyric_idx_local = [i for i in text_idx if '台词' in headers[i] and '字幕' not in headers[i]]
+    if not lyric_idx_local:
+        lyric_idx_local = text_idx  # 兜底：没有纯台词列时仍用全部文本列
+
+    text_queue: list = []
+    if text_rows:
+        # 以台词列为 key 去重，value 保留完整 text_row（含字幕），取首次出现
+        seen_lyric: dict = {}
+        for tr in text_rows:
+            # tr 的顺序与 text_idx 对应
+            key = tuple(tr[text_idx.index(i)] for i in lyric_idx_local if i in text_idx)
+            if key not in seen_lyric:
+                seen_lyric[key] = tr
+        unique_texts = list(seen_lyric.values())
+        shuffled = unique_texts[:]
+        rng.shuffle(shuffled)
+        text_queue = shuffled[:]
+
     # 生成 count 条
     result = []
     for _ in range(count):
@@ -427,9 +477,9 @@ def _random_combine(templates: list, header_str: str, count: int, seed: int = No
             v = rng.choice(visual_rows)
             for i, val in zip(visual_idx, v):
                 new_parts[i] = val
-        # 台词组整组绑定
+        # 台词组：优先从队列取（保证不重复），队列耗尽后随机
         if text_rows:
-            t = rng.choice(text_rows)
+            t = text_queue.pop(0) if text_queue else rng.choice(text_rows)
             for i, val in zip(text_idx, t):
                 new_parts[i] = val
         # 其余未分类列：独立随机

@@ -246,7 +246,9 @@ def scan_dingtalk_products(content: dict) -> list:
     from excel_parser import _scan_sections  # noqa: E402
 
     sheets = dingtalk_doc_to_sheets(content)
-    results = []
+    # 用 (sheet, 归一化产品名) 为键收集；同键多段合并模板和日期池
+    bucket: dict = {}
+    order: list = []   # 保留原始出现顺序
     for sheet_name, rows in sheets.items():
         if sheet_name == SUMMARY_SHEET_TITLE:
             continue
@@ -258,17 +260,34 @@ def scan_dingtalk_products(content: dict) -> list:
                 continue
             title = sec["title"]
             prod_clean = re.sub(r"[（(][^）)]*[）)]", "", title).strip()
+            key = (sheet_name, _norm_product(prod_clean))
             dates = _extract_section_dates(sec)
-            results.append({
-                "sheet": sheet_name,
-                "title": title,
-                "product_name": prod_clean,
-                "header_str": sec["header_str"],
-                "col_count": sec["col_count"],
-                "templates": sec["templates"],
-                "template_count": len(sec["templates"]),
-                "available_dates": dates,
-            })
+            if key not in bucket:
+                bucket[key] = {
+                    "sheet": sheet_name,
+                    "title": title,            # 以第一段标题为准
+                    "product_name": prod_clean,
+                    "header_str": sec["header_str"],
+                    "col_count": sec["col_count"],
+                    "templates": list(sec["templates"]),
+                    "available_dates": list(dates),
+                    "_seen_dates": set(dates),
+                }
+                order.append(key)
+            else:
+                # 多段合并
+                cur = bucket[key]
+                cur["templates"].extend(sec["templates"])
+                for d in dates:
+                    if d not in cur["_seen_dates"]:
+                        cur["_seen_dates"].add(d)
+                        cur["available_dates"].append(d)
+    results = []
+    for key in order:
+        cur = bucket[key]
+        cur.pop("_seen_dates", None)
+        cur["template_count"] = len(cur["templates"])
+        results.append(cur)
     return results
 
 
@@ -574,15 +593,37 @@ def find_recent_dates(available_dates: list, target_date: str, n: int = 2) -> li
 
 
 def find_section(products: list, sheet: str, product_name: str) -> dict:
-    """按 (sheet, product_name) 找段落，匹配规则：sheet 严格相等，product_name 去括号 + 小写。"""
+    """按 (sheet, product_name) 找段落，匹配规则：sheet 严格相等，product_name 去括号 + 小写。
+
+    若同一产品存在多个段落（甲方文档里同一产品有多个日期段），
+    将所有段落的模板行和可用日期合并成一个虚拟段落返回。
+    这样 filter_templates_by_date 才能按日期列正确筛选，不依赖段落位置顺序。
+    """
     def norm(s: str) -> str:
         return re.sub(r"[（(][^）)]*[）)]", "", s or "").strip().lower()
     pn = norm(product_name)
     sn = (sheet or "").strip()
-    for p in products or []:
-        if (p.get("sheet") or "").strip() == sn and norm(p.get("product_name")) == pn:
-            return p
-    return None
+    matches = [p for p in (products or [])
+               if (p.get("sheet") or "").strip() == sn and norm(p.get("product_name")) == pn]
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+
+    # 多段合并：把所有段落的模板行和日期池合并为一个虚拟段落
+    print(f"    ℹ️  「{sheet}·{product_name}」找到 {len(matches)} 个同名段落，合并所有模板行后按日期筛选")
+    merged = dict(matches[0])   # 以第一段的 header_str / col_count 等元数据为基础
+    all_templates = []
+    seen_dates, all_dates = set(), []
+    for m in matches:
+        all_templates.extend(m.get("templates", []))
+        for d in m.get("available_dates", []):
+            if d not in seen_dates:
+                seen_dates.add(d)
+                all_dates.append(d)
+    merged["templates"]       = all_templates
+    merged["available_dates"] = all_dates
+    return merged
 
 
 # ============================================================

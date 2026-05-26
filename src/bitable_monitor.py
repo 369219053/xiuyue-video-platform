@@ -149,7 +149,6 @@ def _get_field(record: dict, field_name: str) -> str:
 # ── 监控核心逻辑 ───────────────────────────────────────────────
 def _scan_group(group: dict, executor, in_progress: set, tk_cache: dict):
     app_token  = (group.get("appToken") or "").strip() or os.getenv("BITABLE_APP_TOKEN", "")
-    wf2_id     = (group.get("wf2")      or "").strip() or os.getenv("WORKFLOW2_ID", "")
     wf3_id     = (group.get("wf3")      or "").strip() or os.getenv("WORKFLOW3_ID", "")
     wf4_id     = (group.get("wf4")      or "").strip() or os.getenv("WORKFLOW4_ID", "")
     coze_token = (group.get("cozeToken") or "").strip() or os.getenv("COZE_TOKEN_1", "")
@@ -159,12 +158,23 @@ def _scan_group(group: dict, executor, in_progress: set, tk_cache: dict):
         _log(f"⚠️ [{label}] 未配置 Base Token，跳过"); return
 
     import time
+    # 飞书 tenant_access_token 缓存（失败自动重试，最多3次）
     if time.time() > tk_cache.get("expire", 0) - 60:
-        tk_cache["val"]    = _get_feishu_token()
-        tk_cache["expire"] = time.time() + 7000
+        for _retry in range(3):
+            try:
+                tk_cache["val"]    = _get_feishu_token()
+                tk_cache["expire"] = time.time() + 7000
+                break
+            except Exception as e:
+                wait = 2 ** _retry
+                _log(f"⚠️ [{label}] 获取飞书Token失败（第{_retry+1}次）: {e}，{wait}s后重试")
+                time.sleep(wait)
+        else:
+            _log(f"❌ [{label}] 获取飞书Token连续失败3次，跳过本轮扫描")
+            return
     tk = tk_cache["val"]
 
-    test_mode = not any([wf2_id, wf3_id, wf4_id])
+    test_mode = not any([wf3_id, wf4_id])
     try:
         tables = _list_tables(tk, app_token)
     except Exception as e:
@@ -182,7 +192,7 @@ def _scan_group(group: dict, executor, in_progress: set, tk_cache: dict):
             first_id = tables[0]["table_id"]
             records  = _list_records(tk, app_token, first_id)
             _log(f"  [预览] 共 {len(records)} 条记录")
-            WATCH = ["生图提示词", "图片url", "启动视频", "视频提示词", "比例", "字幕", "视频生成"]
+            WATCH = ["图片url", "启动视频", "视频提示词", "比例", "字幕", "视频生成"]
             for i, rec in enumerate(records[:3]):
                 _log(f"  记录{i+1} [{rec['record_id'][:8]}]:")
                 for fn in WATCH:
@@ -200,37 +210,15 @@ def _scan_group(group: dict, executor, in_progress: set, tk_cache: dict):
         except Exception as e:
             _log(f"❌ [{label}][{table_name}] 拉取记录失败: {e}"); continue
 
-        tasks2, tasks3, tasks4 = [], [], []
+        tasks3, tasks4 = [], []
         for rec in records:
             rid = rec["record_id"]
             if rid in in_progress: continue
             f = lambda n, r=rec: _get_field(r, n)
-            if wf2_id and f("生图提示词") and f("比例") and not f("图片url"):
-                tasks2.append(rec)
-            elif wf3_id and f("启动视频") and f("图片url") and f("视频提示词") and f("比例") and not f("视频生成"):
+            if wf3_id and f("启动视频") and f("图片url") and f("视频提示词") and f("比例") and not f("视频生成"):
                 tasks3.append(rec)
             elif wf4_id and f("视频生成") and f("字幕") and not f("视频剪辑"):
                 tasks4.append(rec)
-
-        def run2(rec, tid=table_id, tname=table_name):
-            rid = rec["record_id"]; in_progress.add(rid)
-            try:
-                f = lambda n: _get_field(rec, n)
-                _log(f"🎨 [{label}][{tname}] 生图 {rid[:8]}")
-                result = _call_coze(wf2_id, {"input": f("生图提示词"), "ratio": f("比例")}, coze_token)
-                _log(f"  工作流返回: {str(result)[:200]}")
-                raw = result.get("图片url") or result.get("image_url") or result.get("url") or result.get("output") or ""
-                url = str(raw[0] if isinstance(raw, list) and raw else raw).strip()
-                if url:
-                    _update_record(tk, app_token, tid, rid, {"图片url": url})
-                    _log(f"✅ [{label}][{tname}] 生图完成 {rid[:8]} → {url[:60]}")
-                    with _monitor_lock: _monitor_stats["stage2"] += 1
-                else:
-                    _log(f"⚠️ [{label}][{tname}] 生图无url {rid[:8]} 完整返回: {result}")
-            except Exception as e:
-                _log(f"❌ [{label}][{tname}] 生图失败 {rid[:8]}: {e}")
-                with _monitor_lock: _monitor_stats["errors"] += 1
-            finally: in_progress.discard(rid)
 
         def run3(rec, tid=table_id, tname=table_name):
             rid = rec["record_id"]; in_progress.add(rid)
@@ -242,7 +230,11 @@ def _scan_group(group: dict, executor, in_progress: set, tk_cache: dict):
                 raw = result.get("视频url") or result.get("video_url") or result.get("url") or result.get("output") or ""
                 url = str(raw[0] if isinstance(raw, list) and raw else raw).strip()
                 if url:
-                    _update_record(tk, app_token, tid, rid, {"视频生成": url})
+                    fields = {"视频生成": url}
+                    text = result.get("text", "")
+                    if text:
+                        fields["识别台词"] = str(text).strip()
+                    _update_record(tk, app_token, tid, rid, fields)
                     _log(f"✅ [{label}][{tname}] 生视频完成 {rid[:8]} → {url[:60]}")
                     with _monitor_lock: _monitor_stats["stage3"] += 1
                 else:
@@ -272,11 +264,10 @@ def _scan_group(group: dict, executor, in_progress: set, tk_cache: dict):
                 with _monitor_lock: _monitor_stats["errors"] += 1
             finally: in_progress.discard(rid)
 
-        for rec in tasks2: executor.submit(run2, rec)
         for rec in tasks3: executor.submit(run3, rec)
         for rec in tasks4: executor.submit(run4, rec)
-        if tasks2 or tasks3 or tasks4:
-            _log(f"📊 [{label}][{table_name}] 生图{len(tasks2)} 生视频{len(tasks3)} 字幕{len(tasks4)}")
+        if tasks3 or tasks4:
+            _log(f"📊 [{label}][{table_name}] 生视频{len(tasks3)} 字幕{len(tasks4)}")
 
 
 def _monitor_loop():
@@ -376,7 +367,6 @@ HTML = """<!DOCTYPE html>
     <button class="btn-add" onclick="addGroup()">➕ 添加监控组</button>
   </div>
   <div class="stats">
-    <div class="stat">🎨 生图: <b id="s2">0</b></div>
     <div class="stat">🎬 生视频: <b id="s3">0</b></div>
     <div class="stat">📝 加字幕: <b id="s4">0</b></div>
     <div class="stat">❌ 错误: <b id="se">0</b></div>
@@ -399,7 +389,6 @@ function readGroups() {
     name:       val('g_name_'+i),
     appToken:   val('g_token_'+i),
     cozeToken:  val('g_coze_'+i),
-    wf2:        val('g_wf2_'+i),
     wf3:        val('g_wf3_'+i),
     wf4:        val('g_wf4_'+i),
   }));
@@ -418,10 +407,9 @@ function renderGroups() {
       </div>
       <div class="row">
         <div><label>Coze Token</label><input id="g_coze_${i}" value="${g.cozeToken||''}" placeholder="sat_..."></div>
-        <div><label>生图 Workflow ID</label><input id="g_wf2_${i}" value="${g.wf2||''}"></div>
+        <div><label>生视频 Workflow ID</label><input id="g_wf3_${i}" value="${g.wf3||''}"></div>
       </div>
       <div class="row">
-        <div><label>生视频 Workflow ID</label><input id="g_wf3_${i}" value="${g.wf3||''}"></div>
         <div><label>加字幕 Workflow ID</label><input id="g_wf4_${i}" value="${g.wf4||''}"></div>
       </div>
     </div>`).join('');

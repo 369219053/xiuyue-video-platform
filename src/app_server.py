@@ -32,7 +32,12 @@ def _load_env_file(path: str = ".env"):
 
 _load_env_file()
 
-import webview
+# webview 仅在桌面模式下使用，云服务器环境无需安装
+try:
+    import webview
+    _WEBVIEW_AVAILABLE = True
+except ImportError:
+    _WEBVIEW_AVAILABLE = False
 
 
 def _curl_get(url: str, params: dict = None, cookies: dict = None,
@@ -1435,24 +1440,28 @@ def expand_product_route():
 # 全流程自动化路由
 # ============================================================
 def _call_coze_sync(token: str, workflow_id: str, input_data: list, name: str,
-                    timeout: int = 15) -> dict:
+                    timeout: int = 15, bitable_url: str = "") -> dict:
     """
     触发 Coze 工作流（fire-and-forget）。
     只要请求发出、Coze 服务端收到即视为成功，不等工作流执行结果。
     超时 15 秒：足够建连 + 发送请求体，到时间直接返回成功。
     retries=0：绝不重复触发。
+    bitable_url: 飞书多维表格 URL，非空时作为 url 入参传给工作流。
     """
-    url = 'https://api.coze.cn/v1/workflow/run'
+    api_url = 'https://api.coze.cn/v1/workflow/run'
+    params = {
+        'input': input_data,
+        'name':  name,
+    }
+    if bitable_url:
+        params['url'] = bitable_url
     body = {
         'workflow_id': workflow_id,
-        'parameters': {
-            'input': input_data,
-            'name':  name,
-        }
+        'parameters': params,
     }
     headers = {'Authorization': f'Bearer {token}'}
     try:
-        return _curl_post(url, body, headers=headers, timeout=timeout, retries=0)
+        return _curl_post(api_url, body, headers=headers, timeout=timeout, retries=0)
     except RuntimeError:
         # curl 超时 = 请求已发出，Coze 正在执行中，视为成功
         return {"code": 0, "msg": "已触发"}
@@ -1826,7 +1835,13 @@ def _cdp_create_tables_multi(buckets):
                         entry['key'] = final_name
                         yield (True, f"⚠️ 副表 {requested} 已存在，自动改名为 {final_name}")
                     _record_created_subtable(base_token, final_name)
-                    yield (True, f"✅ 副表已创建：{final_name}")
+                    # 捕获当前页面 URL（含 ?table=xxx），传给后续工作流
+                    try:
+                        page.wait_for_timeout(800)  # 等浏览器 URL 更新
+                        entry['bitable_url'] = page.url
+                    except Exception:
+                        entry['bitable_url'] = f"https://my.feishu.cn/base/{base_token}"
+                    yield (True, f"✅ 副表已创建：{final_name}（url={entry['bitable_url'][:60]}）")
                 except Exception as e:
                     yield (False, f"❌ 副表创建失败：{requested} → {str(e)[:120]}")
                     try:
@@ -2354,13 +2369,18 @@ def run_coze_cdp():
             _name     = product.get("key", "")
             _inp_data = product.get("data", [])
             _tag      = f"[#{account_idx+1}]"
+            # 优先用 CDP 建表后捕获的完整 URL（含 ?table=xxx），
+            # 没有时回退到 base 首页 URL
+            _bt = account.get("baseToken", "")
+            _bitable_url = (product.get("bitable_url", "")
+                            or (f"https://my.feishu.cn/base/{_bt}" if _bt else ""))
             # 服务端 stderr 也打一份，方便从终端定位卡点
             print(f"{_tag} ▶ 触发 Coze: {_name}  workflow={account.get('workflowId','')[:12]}...",
                   file=_sys.stderr, flush=True)
             _t0 = _time.time()
             try:
                 _result = _call_coze_sync(account["cozeToken"], account["workflowId"],
-                                          _inp_data, _name, timeout=60)
+                                          _inp_data, _name, timeout=60, bitable_url=_bitable_url)
                 _raw    = _result.get('data', {})
                 if isinstance(_raw, str):
                     try:    _raw = json.loads(_raw)
@@ -2722,6 +2742,15 @@ HTML = """<!DOCTYPE html>
   .dt-modal-warn { display:none; flex-shrink:0; padding:8px 20px; font-size:12px;
                    color:#b91c1c; background:#fef2f2; border-bottom:1px solid #fecaca; }
   .dt-modal-body { flex:1; overflow:auto; background:#fafafa; }
+  /* ── 预览弹窗 Tab 切换 ── */
+  .dt-modal-tabs { display:flex; flex-shrink:0; border-bottom:2px solid #e5e7eb;
+                   background:#fff; padding:0 20px; }
+  .dt-modal-tab  { padding:10px 18px; font-size:13px; font-weight:600; cursor:pointer;
+                   border:none; background:transparent; color:#6b7280;
+                   border-bottom:2px solid transparent; margin-bottom:-2px;
+                   transition:color .15s, border-color .15s; }
+  .dt-modal-tab.active  { color:#0284c7; border-bottom-color:#0284c7; }
+  .dt-modal-tab:hover:not(.active) { color:#374151; }
 </style>
 </head>
 <body>
@@ -2740,21 +2769,76 @@ HTML = """<!DOCTYPE html>
 <div id="dt-preview-modal" class="dt-modal-mask" style="display:none"
      onclick="if(event.target===this) dtCancelPreview()">
   <div class="dt-modal-box">
-    <!-- 固定头部：标题 + 开始执行 + 关闭 -->
+    <!-- 固定头部：标题 + 按钮 + 关闭 -->
     <div class="dt-modal-head">
       <div class="dm-title">
-        <h3>📋 副表预览</h3>
+        <h3 id="dt-modal-title">📋 副表预览</h3>
         <p id="dt-preview-summary">正在加载...</p>
       </div>
       <button id="dt-btn-confirm" class="dt-modal-exec" onclick="dtConfirmExecute()">
         ⚡ 开始执行
       </button>
+      <button id="dt-btn-direct-call" class="dt-modal-exec"
+              style="display:none;background:linear-gradient(135deg,#0284c7,#0369a1)"
+              onclick="directCallWF1()">
+        ⚡ 直接调用 WF1
+      </button>
       <button class="dt-modal-close" onclick="dtCancelPreview()" title="关闭">✕</button>
+    </div>
+    <!-- Tab 切换栏 -->
+    <div class="dt-modal-tabs">
+      <button class="dt-modal-tab active" id="dt-tab-preview" onclick="dtSwitchTab('preview')">
+        📋 副表预览
+      </button>
+      <button class="dt-modal-tab" id="dt-tab-direct" onclick="dtSwitchTab('direct')">
+        🚀 直接调用
+      </button>
     </div>
     <!-- 警告区（固定，不随内容滚动） -->
     <div id="dt-preview-warnings" class="dt-modal-warn"></div>
-    <!-- 可滚动的副表列表 -->
+    <!-- 面板1：可滚动的副表列表 -->
     <div id="dt-preview-list" class="dt-modal-body"></div>
+    <!-- 面板2：直接调用模式 -->
+    <div id="dt-direct-panel" class="dt-modal-body" style="display:none;padding:20px">
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px">
+        <div style="flex:1;min-width:160px">
+          <label style="font-size:12px;color:#0369a1;font-weight:600;display:block;margin-bottom:4px">
+            选择账号
+          </label>
+          <select id="direct-acc-select"
+                  style="width:100%;padding:8px 10px;border:1px solid #7dd3fc;border-radius:8px;
+                         font-size:13px;background:#fff"
+                  onchange="directClearTables()">
+            <option value="">-- 请先配置账号 --</option>
+          </select>
+        </div>
+        <button onclick="directFetchTables()"
+                style="padding:8px 20px;background:#0284c7;color:#fff;border:none;
+                       border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;
+                       white-space:nowrap;height:38px">
+          🔄 拉取子表列表
+        </button>
+        <span id="direct-status" style="font-size:12px;color:#64748b;align-self:center"></span>
+      </div>
+      <div style="margin-bottom:12px">
+        <label style="font-size:12px;color:#0369a1;font-weight:600;display:block;margin-bottom:4px">
+          选择现有子表
+        </label>
+        <select id="direct-table-select"
+                style="width:100%;padding:8px 10px;border:1px solid #7dd3fc;border-radius:8px;
+                       font-size:13px;background:#fff">
+          <option value="">-- 先点「拉取子表列表」--</option>
+        </select>
+      </div>
+      <div style="font-size:12px;color:#64748b;margin-bottom:12px;
+                  background:#f0f9ff;padding:8px 12px;border-radius:6px">
+        💡 <b>input 参数</b>：自动使用当前已勾选产品的数据（未勾选则传空数组）
+      </div>
+      <div id="direct-log"
+           style="display:none;background:#1a1a2e;color:#e0e0e0;padding:10px 14px;
+                  border-radius:8px;font-size:12px;font-family:monospace;
+                  max-height:220px;overflow-y:auto;white-space:pre-wrap"></div>
+    </div>
   </div>
 </div>
 
@@ -2839,6 +2923,16 @@ HTML = """<!DOCTYPE html>
                 style="padding:3px 10px;font-size:11px;background:#d1fae5;color:#065f46;
                        border:1px solid #6ee7b7;border-radius:6px;cursor:pointer;font-weight:600">
           ✨ 自动填入
+        </button>
+        <button onclick="dtLyricFill('all')"
+                style="padding:3px 10px;font-size:11px;background:#dbeafe;color:#1e40af;
+                       border:1px solid #93c5fd;border-radius:6px;cursor:pointer;font-weight:600">
+          📝 台词填入
+        </button>
+        <button onclick="dtTopUpFill('all')"
+                style="padding:3px 10px;font-size:11px;background:#fef3c7;color:#92400e;
+                       border:1px solid #fcd34d;border-radius:6px;cursor:pointer;font-weight:600">
+          ➕ 补齐填入
         </button>
         <button onclick="dtClearFill('all')"
                 style="padding:3px 10px;font-size:11px;background:#fee2e2;color:#b91c1c;
@@ -2984,6 +3078,7 @@ HTML = """<!DOCTYPE html>
         </button>
       </div>
     </div>
+
 
     <!-- ── Stage 3：执行日志 ── -->
     <div id="auto-log-wrap" style="display:none;margin-top:14px">
@@ -3184,14 +3279,9 @@ function _accountCardHTML(idx, cfg) {
     </div>
     <div style="margin-bottom:8px;padding:8px 10px;background:#f0f9ff;border-radius:8px;border:1px solid #bae6fd">
       <div style="font-size:11px;color:#0369a1;font-weight:700;margin-bottom:6px">
-        🤖 监控工作流（生图/视频/字幕，与建副表并行运行）
+        🤖 监控工作流（视频/字幕，与建副表并行运行）
       </div>
       <div style="display:flex;gap:10px">
-        <div style="flex:1">
-          <label style="font-size:11px;color:#0369a1;font-weight:600">生图 WF ID（阶段2，留空跳过）</label>
-          <input class="acc-wf2" placeholder="7xxxxxxxxxxxxxxxxx" value="${cfg.wf2||''}"
-                 style="border-color:#7dd3fc;font-size:12px" oninput="autoSaveConfig()">
-        </div>
         <div style="flex:1">
           <label style="font-size:11px;color:#0369a1;font-weight:600">生视频 WF ID（阶段3）</label>
           <input class="acc-wf3" placeholder="7xxxxxxxxxxxxxxxxx" value="${cfg.wf3||''}"
@@ -3313,7 +3403,6 @@ function getAccounts() {
     feishuUserToken: (card.querySelector('.acc-feishu-utoken').value || '').trim(),
     feishuAppId:     (card.querySelector('.acc-feishu-appid').value || '').trim(),
     feishuAppSecret: (card.querySelector('.acc-feishu-appsecret').value || '').trim(),
-    wf2:             (card.querySelector('.acc-wf2')?.value || '').trim(),
     wf3:             (card.querySelector('.acc-wf3')?.value || '').trim(),
     wf4:             (card.querySelector('.acc-wf4')?.value || '').trim(),
   }));
@@ -3563,13 +3652,36 @@ async function dtSync() {
       if (list) list.innerHTML = '<div style="color:#dc2626;padding:20px">❌ 同步失败：' + (r.msg || '未知错误') + '</div>';
       return;
     }
-    _dtProducts  = r.products || [];
     _dtModeMap   = r.mode_map || {};
     _dtDemandMap = r.demand_map || {};
+    const incoming = r.products || [];
+
+    // ── 新品检测：与上次同步的产品 key 集合做比对 ──
+    let prevKeys = new Set();
+    try {
+      const stored = localStorage.getItem('dt_prev_product_keys');
+      if (stored) prevKeys = new Set(JSON.parse(stored));
+    } catch(e) {}
+    const isFirstSync = (prevKeys.size === 0);
+
+    incoming.forEach(p => {
+      const k = (p.sheet || '') + '::' + (p.product_name || p.title || '');
+      p.isNew = !isFirstSync && !prevKeys.has(k);
+    });
+
+    // 保存本次产品 key 集合，供下次比对
+    try {
+      localStorage.setItem('dt_prev_product_keys',
+        JSON.stringify(incoming.map(p => (p.sheet || '') + '::' + (p.product_name || p.title || ''))));
+    } catch(e) {}
+
+    _dtProducts = incoming;
+    const newCount = incoming.filter(p => p.isNew).length;
     if (sum) {
       sum.style.display = '';
       sum.innerHTML = '✅ 同步成功 · <b>' + (r.product_count || 0) + '</b> 个产品 · <b>'
-                    + (r.mode_map_count || 0) + '</b> 条模式映射 · 时间 ' + new Date().toLocaleTimeString();
+                    + (r.mode_map_count || 0) + '</b> 条模式映射 · 时间 ' + new Date().toLocaleTimeString()
+                    + (newCount > 0 ? ' · <span style="color:#dc2626;font-weight:700">🆕 ' + newCount + ' 个新品</span>' : '');
     }
     _renderDtProducts();
   } catch(e) {
@@ -3719,6 +3831,14 @@ function _renderDtProducts() {
          +       'border:1px solid #6ee7b7;border-radius:6px;cursor:pointer;font-weight:600"'
          +       ' onclick="dtAutoFill(\\'sheet\\',\\'' + safeS + '\\')">'
          +       '✨ 自动填入</button>'
+         +     '<button style="padding:3px 10px;font-size:11px;background:#dbeafe;color:#1e40af;'
+         +       'border:1px solid #93c5fd;border-radius:6px;cursor:pointer;font-weight:600"'
+         +       ' onclick="dtLyricFill(\\'sheet\\',\\'' + safeS + '\\')">'
+         +       '📝 台词填入</button>'
+         +     '<button style="padding:3px 10px;font-size:11px;background:#fef3c7;color:#92400e;'
+         +       'border:1px solid #fcd34d;border-radius:6px;cursor:pointer;font-weight:600"'
+         +       ' onclick="dtTopUpFill(\\'sheet\\',\\'' + safeS + '\\')">'
+         +       '➕ 补齐填入</button>'
          +     '<button style="padding:3px 10px;font-size:11px;background:#fee2e2;color:#b91c1c;'
          +       'border:1px solid #fca5a5;border-radius:6px;cursor:pointer;font-weight:600"'
          +       ' onclick="dtClearFill(\\'sheet\\',\\'' + safeS + '\\')">'
@@ -3781,13 +3901,37 @@ function _dtCardHTML(p) {
     ? ('<b>' + escHtml(taskDates.join(' / ')) + '</b>')
     : '<span style="color:#dc2626">未排任务</span>';
   const tplText = avail.length ? avail.join(' / ') : '无';
+
+  // 新品标记
+  const newBadge = p.isNew
+    ? '<span style="background:#fee2e2;color:#b91c1c;padding:2px 8px;border-radius:5px;'
+    +   'font-size:11px;font-weight:700;border:1px solid #fca5a5">🆕 新品</span> '
+    : '';
+
+  // 台词套数徽章
+  const m1c = (p.m1_lyrics != null && p.m1_lyrics > 0) ? p.m1_lyrics : null;
+  const m2c = (p.m2_lyrics != null && p.m2_lyrics > 0) ? p.m2_lyrics : null;
+  const m1Badge = m1c !== null
+    ? '<span style="background:#ede9fe;color:#5b21b6;padding:2px 7px;border-radius:5px;'
+    +   'font-size:11px;font-weight:700;cursor:default" title="模式1下最近日期的唯一台词数（建议条数≤此值）">M1: '
+    + m1c + '套</span> '
+    : '';
+  const m2Badge = m2c !== null
+    ? '<span style="background:#fef3c7;color:#92400e;padding:2px 7px;border-radius:5px;'
+    +   'font-size:11px;font-weight:700;cursor:default" title="模式2下最近2个日期合并的唯一台词数">M2: '
+    + m2c + '套</span>'
+    : '';
+
   return '<div class="dt-card' + (isSel ? ' selected' : '') + '" data-key="' + escHtml(k) + '">'
        +   '<div class="dt-card-head">'
        +     '<input type="checkbox" class="dt-chk" data-key="' + escHtml(k) + '"'
        +       (isSel ? ' checked' : '')
        +       ' onchange="dtToggleProductSelect(\\'' + safeK + '\\',this.checked)"'
        +       ' style="width:auto;accent-color:#10b981;cursor:pointer">'
-       +     '<span class="dt-card-name">' + escHtml(p.product_name || p.title || '?') + '</span>'
+       +     '<span class="dt-card-name">' + newBadge + escHtml(p.product_name || p.title || '?') + '</span>'
+       +     '<span style="display:flex;gap:4px;align-items:center;flex-shrink:0">'
+       +       m1Badge + m2Badge
+       +     '</span>'
        +     '<span class="dt-card-meta">汇总表任务: ' + taskText + '</span>'
        +     '<span class="dt-card-meta" style="color:#9ca3af">原料模板: '
        +       escHtml(tplText) + '（' + (p.template_count || 0) + ' 行）</span>'
@@ -3885,6 +4029,69 @@ function dtAutoFill(scope, key) {
     dtUpdateTaskSummary();
   } else {
     alert('没有找到对应的需求数量（请确认汇总表里该产品/日期有填写需求数量）');
+  }
+}
+
+// 台词填入：按该行模式填入对应台词套数
+function dtLyricFill(scope, key) {
+  let targets = [];
+  if (scope === 'all') {
+    targets = _dtProducts;
+  } else if (scope === 'sheet') {
+    targets = _dtProducts.filter(p => p.sheet === key);
+  } else {
+    targets = _dtProducts.filter(p => _dtProductKey(p) === key);
+  }
+  let filled = 0;
+  targets.forEach(p => {
+    const rows = _dtEnsureTaskRows(p);
+    rows.forEach((row, ri) => {
+      const mode = _dtLookupMode(p.sheet, p.product_name, row.date);
+      const cnt = (mode === 2) ? (p.m2_lyrics || 0) : (p.m1_lyrics || 0);
+      if (cnt > 0) {
+        rows[ri].count = cnt;
+        filled++;
+      }
+    });
+  });
+  if (filled > 0) {
+    _renderDtProducts();
+    dtUpdateTaskSummary();
+  } else {
+    alert('没有找到台词套数（请先同步数据，并确认汇总表里已配置模式）');
+  }
+}
+
+// 补齐填入：填入「需求总量 - 台词套数」的剩余数量
+function dtTopUpFill(scope, key) {
+  let targets = [];
+  if (scope === 'all') {
+    targets = _dtProducts;
+  } else if (scope === 'sheet') {
+    targets = _dtProducts.filter(p => p.sheet === key);
+  } else {
+    targets = _dtProducts.filter(p => _dtProductKey(p) === key);
+  }
+  let filled = 0;
+  targets.forEach(p => {
+    const rows = _dtEnsureTaskRows(p);
+    rows.forEach((row, ri) => {
+      const demandKey = p.sheet + '||' + _dtNormName(p.product_name) + '||' + _dtNormDate(row.date);
+      const demand = _dtDemandMap[demandKey] || 0;
+      const mode = _dtLookupMode(p.sheet, p.product_name, row.date);
+      const lyric = (mode === 2) ? (p.m2_lyrics || 0) : (p.m1_lyrics || 0);
+      const remaining = Math.max(0, demand - lyric);
+      if (remaining > 0) {
+        rows[ri].count = remaining;
+        filled++;
+      }
+    });
+  });
+  if (filled > 0) {
+    _renderDtProducts();
+    dtUpdateTaskSummary();
+  } else {
+    alert('没有可补齐的数量（请确认需求总量 > 台词套数）');
   }
 }
 
@@ -4903,6 +5110,9 @@ function autoExecute() {
             ...p.rows.map(r => r.join(' // '))]
   }));
 
+  // ── 自动启动监控（如果还没在跑）──
+  _autoStartMonitorIfNeeded(accounts, log);
+
   fetch('/api/run-coze-cdp', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -4948,6 +5158,131 @@ function autoExecute() {
     log.innerHTML += '<div style="color:#f87171">❌ 请求失败: ' + e + '</div>';
     btn.disabled = false;
     btn.textContent = '⚡ 确认，开始执行';
+  });
+}
+
+// ============================================================
+// 直接调用模式（弹窗 Tab）
+// ============================================================
+let _directTables = [];   // [{table_id, name, view_id, view_name}, ...]
+
+// Tab 切换：preview / direct
+function dtSwitchTab(tab) {
+  const isPreview = tab === 'preview';
+  document.getElementById('dt-tab-preview').classList.toggle('active', isPreview);
+  document.getElementById('dt-tab-direct').classList.toggle('active', !isPreview);
+  document.getElementById('dt-preview-list').style.display    = isPreview ? '' : 'none';
+  document.getElementById('dt-direct-panel').style.display    = isPreview ? 'none' : '';
+  document.getElementById('dt-btn-confirm').style.display     = isPreview ? '' : 'none';
+  document.getElementById('dt-btn-direct-call').style.display = isPreview ? 'none' : '';
+  if (!isPreview) directRefreshAccounts();
+}
+
+function directRefreshAccounts() {
+  const sel  = document.getElementById('direct-acc-select');
+  const accs = getAccounts();
+  sel.innerHTML = accs.length
+    ? accs.map((a, i) => `<option value="${i}">${a.name || ('账号' + (i+1))} — ${(a.baseToken||'').slice(0,10) || '未填BaseToken'}</option>`).join('')
+    : '<option value="">-- 请先配置账号 --</option>';
+}
+
+function directClearTables() {
+  _directTables = [];
+  document.getElementById('direct-table-select').innerHTML = '<option value="">-- 先点「拉取子表列表」--</option>';
+}
+
+async function directFetchTables() {
+  const accSel = document.getElementById('direct-acc-select');
+  const accIdx = accSel.value;
+  if (accIdx === '') { alert('请先选择账号'); return; }
+  const status = document.getElementById('direct-status');
+  status.textContent = '🔄 拉取中…';
+  try {
+    const accounts = getAccounts();
+    const params   = new URLSearchParams({ accountIdx: accIdx, accounts: JSON.stringify(accounts) });
+    const resp     = await fetch('/api/list-subtables?' + params);
+    const data     = await resp.json();
+    if (data.error) { alert('拉取失败：' + data.error); status.textContent = ''; return; }
+    _directTables = data.tables || [];
+    const sel = document.getElementById('direct-table-select');
+    if (!_directTables.length) {
+      sel.innerHTML = '<option value="">该 Base 下暂无子表</option>';
+      status.textContent = '共 0 张子表';
+      return;
+    }
+    sel.innerHTML = _directTables.map((t, i) =>
+      `<option value="${i}">${t.name}${t.view_name ? '（' + t.view_name + '）' : ''}</option>`
+    ).join('');
+    status.textContent = `共 ${_directTables.length} 张子表`;
+  } catch(e) {
+    alert('网络错误：' + e);
+    status.textContent = '';
+  }
+}
+
+function directCallWF1() {
+  const accSel   = document.getElementById('direct-acc-select');
+  const tableSel = document.getElementById('direct-table-select');
+  const accIdx   = accSel.value;
+  const tblIdx   = tableSel.value;
+  if (accIdx === '')  { alert('请先选择账号'); return; }
+  if (tblIdx === '' || !_directTables.length) { alert('请先拉取并选择子表'); return; }
+
+  const table    = _directTables[parseInt(tblIdx)];
+  const accounts = getAccounts();
+
+  // 收集已勾选产品的 data 作为 input（没勾就传空）
+  const checked = typeof _parsedProducts !== 'undefined'
+    ? _parsedProducts.filter((_, i) => {
+        const cb = document.getElementById('chk-prod-' + i);
+        return cb && cb.checked;
+      }).map(p => ({ key: p.key, data: p.data || [] }))
+    : [];
+
+  const logEl = document.getElementById('direct-log');
+  const btn   = document.getElementById('dt-btn-direct-call');
+  logEl.style.display = 'block';
+  logEl.textContent   = '';
+  btn.disabled = true;
+
+  fetch('/api/run-coze-direct', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      accounts,
+      accountIdx: parseInt(accIdx),
+      tableId:    table.table_id,
+      tableName:  table.name,
+      viewId:     table.view_id,
+      products:   checked,
+    })
+  }).then(res => {
+    const reader  = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    function read() {
+      reader.read().then(({ done, value }) => {
+        if (done) { btn.disabled = false; return; }
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\\n');
+        buf = lines.pop();
+        lines.forEach(line => {
+          if (!line.startsWith('data: ')) return;
+          const payload = line.slice(6);
+          if (payload === '__DONE__') { btn.disabled = false; return; }
+          try {
+            const obj = JSON.parse(payload);
+            logEl.textContent += (obj.msg || payload) + '\\n';
+            logEl.scrollTop = logEl.scrollHeight;
+          } catch { logEl.textContent += payload + '\\n'; }
+        });
+        read();
+      });
+    }
+    read();
+  }).catch(e => {
+    logEl.textContent += '❌ 请求失败: ' + e + '\\n';
+    btn.disabled = false;
   });
 }
 
@@ -5574,7 +5909,7 @@ function sideAction(type) {
 // ============================================================
 // 飞书多维表格监控 UI 逻辑（多组版）
 // ============================================================
-let _bmGroups = [];      // [{name,appToken,tableId,cozeToken,wf2,wf3,wf4}, ...]
+let _bmGroups = [];      // [{name,appToken,cozeToken,wf3,wf4}, ...]
 let _bmPollTimer = null;
 
 // ── 渲染监控组列表 ──
@@ -5609,10 +5944,6 @@ function bmGroupHTML(g, i) {
     +     '<input style="' + inStyle + '" placeholder="NMwjbb...（留空=使用全局配置）" value="' + (g.appToken||'') + '"'
     +     ' oninput="bmGroupChange(' + i + ',this,&quot;appToken&quot;)">'
     +   '</div>'
-    +   '<div><label style="' + lbStyle + '">阶段2 Workflow（生图）</label>'
-    +     '<input style="' + inStyle + '" placeholder="7xxxxxxxxx（留空=跳过）" value="' + (g.wf2||'') + '"'
-    +     ' oninput="bmGroupChange(' + i + ',this,&quot;wf2&quot;)">'
-    +   '</div>'
     +   '<div><label style="' + lbStyle + '">阶段3 Workflow（生视频）</label>'
     +     '<input style="' + inStyle + '" placeholder="7xxxxxxxxx（留空=跳过）" value="' + (g.wf3||'') + '"'
     +     ' oninput="bmGroupChange(' + i + ',this,&quot;wf3&quot;)">'
@@ -5631,8 +5962,46 @@ function bmGroupChange(i, el, field) {
 }
 
 function bmAddGroup() {
-  _bmGroups.push({ name:'', appToken:'', cozeToken:'', wf2:'', wf3:'', wf4:'' });
+  _bmGroups.push({ name:'', appToken:'', cozeToken:'', wf3:'', wf4:'' });
   bmRenderGroups();
+}
+
+// ── 「开始执行」时自动启动监控（静默，不弹 alert）──
+function _autoStartMonitorIfNeeded(accounts, logEl) {
+  const dlBase = (_dlBases && _dlBases[0] && _dlBases[0].baseToken) ? _dlBases[0].baseToken : '';
+  const groups = accounts
+    .map(a => ({
+      name:      a.name || '',
+      appToken:  a.baseToken || dlBase,
+      cozeToken: a.cozeToken || '',
+      wf3:       a.wf3 || '',
+      wf4:       a.wf4 || '',
+    }))
+    .filter(g => g.appToken && (g.wf3 || g.wf4));  // 至少配了一个监控WF才启动
+
+  if (!groups.length) return;  // 没填监控WF就不管
+
+  // 先查状态，已经在跑就不重复启动
+  fetch('/api/bitable/status').then(r => r.json()).then(d => {
+    if (d.running) {
+      if (logEl) logEl.insertAdjacentHTML('beforeend',
+        '<div style="color:#38bdf8">🤖 监控已在运行中，无需重复启动</div>');
+      return;
+    }
+    // 没跑 → 用当前账号配置自动启动
+    fetch('/api/bitable/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ groups }),
+    }).then(r => r.json()).then(d2 => {
+      if (d2.ok) {
+        bmSetGlobalBadge(true);
+        bmStartPoll();
+        if (logEl) logEl.insertAdjacentHTML('beforeend',
+          '<div style="color:#38bdf8">🤖 监控已自动启动（' + groups.length + ' 个账号），将持续监控 WF3/WF4</div>');
+      }
+    }).catch(() => {});
+  }).catch(() => {});
 }
 
 // ── 从账号卡片一键同步到监控组 ──
@@ -5644,7 +6013,6 @@ function bmSyncFromAccounts() {
       name:       a.name || '',
       appToken:   a.baseToken || dlBase,
       cozeToken:  a.cozeToken || '',
-      wf2:        a.wf2 || '',
       wf3:        a.wf3 || '',
       wf4:        a.wf4 || '',
     }))
@@ -5678,7 +6046,7 @@ function bmLoadGroups() {
   fetch('/api/bitable/load-groups').then(r => r.json()).then(d => {
     const saved = d.groups;
     _bmGroups = (Array.isArray(saved) && saved.length) ? saved : [];
-    if (!_bmGroups.length) _bmGroups = [{ name:'', appToken:'', cozeToken:'', wf2:'', wf3:'', wf4:'' }];
+    if (!_bmGroups.length) _bmGroups = [{ name:'', appToken:'', cozeToken:'', wf3:'', wf4:'' }];
     bmRenderGroups();
   }).catch(() => {
     // 网络异常才降级到 localStorage
@@ -5686,7 +6054,7 @@ function bmLoadGroups() {
       const saved = JSON.parse(localStorage.getItem('bm_groups') || '[]');
       _bmGroups = Array.isArray(saved) ? saved : [];
     } catch(e) { _bmGroups = []; }
-    if (!_bmGroups.length) _bmGroups = [{ name:'', appToken:'', cozeToken:'', wf2:'', wf3:'', wf4:'' }];
+    if (!_bmGroups.length) _bmGroups = [{ name:'', appToken:'', cozeToken:'', wf3:'', wf4:'' }];
     bmRenderGroups();
   });
 }
@@ -5701,9 +6069,8 @@ function bmCollectGroups() {
       name:       inputs[0].value.trim(),
       cozeToken:  inputs[1].value.trim(),
       appToken:   inputs[2].value.trim(),
-      wf2:        inputs[3].value.trim(),
-      wf3:        inputs[4].value.trim(),
-      wf4:        inputs[5].value.trim(),
+      wf3:        inputs[3].value.trim(),
+      wf4:        inputs[4].value.trim(),
     });
   });
   return groups;
@@ -5819,6 +6186,18 @@ def _bitable_list_tables(token: str, app_token: str) -> list:
         raise RuntimeError(f"获取子表列表失败: {data}")
     return data.get("data", {}).get("items", [])
 
+def _bitable_list_views(token: str, app_token: str, table_id: str) -> list:
+    """获取子表下所有视图，返回 [{view_id, view_type, view_name}, ...]"""
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.get(
+        f"{_FEISHU_HOST_API}/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/views",
+        headers=headers, timeout=15
+    )
+    data = resp.json()
+    if data.get("code") != 0:
+        return []
+    return data.get("data", {}).get("items", [])
+
 def _bitable_list_records(token: str, app_token: str, table_id: str) -> list:
     """拉取多维表格所有记录（自动翻页）"""
     records = []
@@ -5902,7 +6281,6 @@ def _bitable_monitor_one_group(group: dict, executor, in_progress: set, tk_cache
     """处理单个监控组的一轮扫描（自动发现并遍历所有子表）"""
     # UI 填的优先，留空则用 .env 里的全局配置
     app_token  = (group.get("appToken") or "").strip()  or os.getenv("BITABLE_APP_TOKEN", "")
-    wf2_id     = (group.get("wf2")      or "").strip()  or os.getenv("WORKFLOW2_ID", "")
     wf3_id     = (group.get("wf3")      or "").strip()  or os.getenv("WORKFLOW3_ID", "")
     wf4_id     = (group.get("wf4")      or "").strip()  or os.getenv("WORKFLOW4_ID", "")
     coze_token = (group.get("cozeToken") or "").strip() or os.getenv("COZE_TOKEN_1", "")
@@ -5913,13 +6291,23 @@ def _bitable_monitor_one_group(group: dict, executor, in_progress: set, tk_cache
         return
 
     import time
-    # 飞书 tenant_access_token 缓存
+    # 飞书 tenant_access_token 缓存（失败自动重试，最多3次）
     if time.time() > tk_cache.get("expire", 0) - 60:
-        tk_cache["val"]    = _get_feishu_token()
-        tk_cache["expire"] = time.time() + 7000
+        for _retry in range(3):
+            try:
+                tk_cache["val"]    = _get_feishu_token()
+                tk_cache["expire"] = time.time() + 7000
+                break
+            except Exception as e:
+                wait = 2 ** _retry
+                _bitable_log(f"⚠️ [{label}] 获取飞书Token失败（第{_retry+1}次）: {e}，{wait}s后重试")
+                time.sleep(wait)
+        else:
+            _bitable_log(f"❌ [{label}] 获取飞书Token连续失败3次，跳过本轮扫描")
+            return
     tk = tk_cache["val"]
 
-    test_mode = not any([wf2_id, wf3_id, wf4_id])
+    test_mode = not any([wf3_id, wf4_id])
 
     # ── 自动获取所有子表 ──
     try:
@@ -5944,7 +6332,7 @@ def _bitable_monitor_one_group(group: dict, executor, in_progress: set, tk_cache
             first_name = tables[0].get("name", first_id)
             records = _bitable_list_records(tk, app_token, first_id)
             _bitable_log(f"  [预览子表: {first_name}] 共 {len(records)} 条记录")
-            WATCH = ["生图提示词", "图片url", "启动视频", "视频提示词", "比例", "字幕", "视频生成", "时长"]
+            WATCH = ["图片url", "启动视频", "视频提示词", "比例", "字幕", "视频生成", "时长"]
             for i, rec in enumerate(records[:3]):
                 _bitable_log(f"  记录{i+1} [{rec['record_id'][:8]}]:")
                 for fn in WATCH:
@@ -5966,47 +6354,16 @@ def _bitable_monitor_one_group(group: dict, executor, in_progress: set, tk_cache
             _bitable_log(f"❌ [{label}][{table_name}] 拉取记录失败: {e}")
             continue
 
-        tasks2, tasks3, tasks4 = [], [], []
+        tasks3, tasks4 = [], []
         for rec in records:
             rid = rec["record_id"]
             if rid in in_progress:
                 continue
             f = lambda n, r=rec: _get_field(r, n)
-            if wf2_id and f("生图提示词") and f("比例") and not f("图片url"):
-                tasks2.append(rec)
-            elif wf3_id and f("启动视频") and f("图片url") and f("视频提示词") and f("比例") and not f("视频生成"):
+            if wf3_id and f("启动视频") and f("图片url") and f("视频提示词") and f("比例") and not f("视频生成"):
                 tasks3.append(rec)
             elif wf4_id and f("视频生成") and f("字幕") and not f("视频剪辑"):
                 tasks4.append(rec)
-
-        def run_stage2(rec, tid=table_id, tname=table_name):
-            rid = rec["record_id"]
-            in_progress.add(rid)
-            try:
-                f = lambda n: _get_field(rec, n)
-                prompt = f("生图提示词")
-                ratio  = f("比例")
-                _bitable_log(f"🎨 [{label}][{tname}] 生图 {rid[:8]} 提示词={prompt[:20]}… 比例={ratio}")
-                result = _call_coze_workflow(wf2_id, {"input": prompt, "ratio": ratio},
-                                             coze_token=coze_token)
-                _bitable_log(f"  工作流返回: {str(result)[:200]}")
-                # 兼容多种返回字段名
-                url = (result.get("图片url") or result.get("image_url") or
-                       result.get("url") or result.get("output") or "")
-                if isinstance(url, list) and url:
-                    url = url[0]
-                url = str(url).strip() if url else ""
-                if url:
-                    _bitable_update_record(tk, app_token, tid, rid, {"图片url": url})
-                    _bitable_log(f"✅ [{label}][{tname}] 生图完成 {rid[:8]} → {url[:60]}")
-                    with _bitable_monitor_lock: _bitable_monitor_stats["stage2"] += 1
-                else:
-                    _bitable_log(f"⚠️ [{label}][{tname}] 生图无url {rid[:8]}，完整返回: {result}")
-            except Exception as e:
-                _bitable_log(f"❌ [{label}][{tname}] 生图失败 {rid[:8]}: {e}")
-                with _bitable_monitor_lock: _bitable_monitor_stats["errors"] += 1
-            finally:
-                in_progress.discard(rid)
 
         def run_stage3(rec, tid=table_id, tname=table_name):
             rid = rec["record_id"]
@@ -6031,7 +6388,11 @@ def _bitable_monitor_one_group(group: dict, executor, in_progress: set, tk_cache
                     url = url[0]
                 url = str(url).strip() if url else ""
                 if url:
-                    _bitable_update_record(tk, app_token, tid, rid, {"视频生成": url})
+                    fields = {"视频生成": url}
+                    text = result.get("text", "")
+                    if text:
+                        fields["识别台词"] = str(text).strip()
+                    _bitable_update_record(tk, app_token, tid, rid, fields)
                     _bitable_log(f"✅ [{label}][{tname}] 生视频完成 {rid[:8]} → {url[:60]}")
                     with _bitable_monitor_lock: _bitable_monitor_stats["stage3"] += 1
                 else:
@@ -6074,11 +6435,10 @@ def _bitable_monitor_one_group(group: dict, executor, in_progress: set, tk_cache
             finally:
                 in_progress.discard(rid)
 
-        for rec in tasks2: executor.submit(run_stage2, rec)
         for rec in tasks3: executor.submit(run_stage3, rec)
         for rec in tasks4: executor.submit(run_stage4, rec)
-        if tasks2 or tasks3 or tasks4:
-            _bitable_log(f"📊 [{label}][{table_name}] 生图{len(tasks2)} 生视频{len(tasks3)} 字幕{len(tasks4)}")
+        if tasks3 or tasks4:
+            _bitable_log(f"📊 [{label}][{table_name}] 生视频{len(tasks3)} 字幕{len(tasks4)}")
 
 
 def _bitable_monitor_loop():
@@ -6155,6 +6515,128 @@ def bitable_status():
     })
 
 
+
+# ============================================================
+# 直接调用模式：拉取子表列表 + 直接触发 WF1
+# ============================================================
+
+@app.route("/api/list-subtables", methods=["GET"])
+def api_list_subtables():
+    """
+    拉取指定账号的飞书 Base 下所有子表（含第一个视图 ID），供前端下拉菜单使用。
+    Query: accountIdx (int, 0-based), accounts (JSON string)
+    Returns: [{name, table_id, view_id, view_name}, ...]
+    """
+    try:
+        accounts_json = request.args.get("accounts", "[]")
+        accounts = json.loads(accounts_json)
+        acc_idx  = int(request.args.get("accountIdx", 0))
+        if acc_idx >= len(accounts):
+            return jsonify({"error": "accountIdx 超出范围"}), 400
+        account   = accounts[acc_idx]
+        app_token = account.get("baseToken", "").strip()
+        if not app_token:
+            return jsonify({"error": "该账号未填写 Base Token"}), 400
+
+        # 获取飞书 token
+        tk = _get_feishu_token()
+
+        # 拉取所有子表
+        tables = _bitable_list_tables(tk, app_token)
+
+        # 为每张子表拉一次视图，取第一个视图 ID
+        result = []
+        for t in tables:
+            tid   = t.get("table_id", "")
+            tname = t.get("name", "")
+            views = _bitable_list_views(tk, app_token, tid)
+            vid   = views[0].get("view_id", "") if views else ""
+            vname = views[0].get("view_name", "") if views else ""
+            result.append({
+                "table_id":  tid,
+                "name":      tname,
+                "view_id":   vid,
+                "view_name": vname,
+            })
+        return jsonify({"tables": result})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/run-coze-direct", methods=["POST"])
+def run_coze_direct():
+    """
+    直接调用模式：跳过 CDP 建副表，直接用现有副表的 URL 触发 WF1。
+    SSE 流式输出。
+    Body: {
+      accounts: [...],
+      accountIdx: int,
+      tableId: str,
+      tableName: str,
+      viewId: str,
+      products: [{key, data}, ...]   # input 参数；可为空
+    }
+    """
+    body       = request.json or {}
+    accounts   = body.get("accounts", [])
+    acc_idx    = int(body.get("accountIdx", 0))
+    table_id   = body.get("tableId", "").strip()
+    table_name = body.get("tableName", "").strip()
+    view_id    = body.get("viewId", "").strip()
+    products   = body.get("products", [])
+
+    def send(msg):
+        return f"data: {json.dumps({'msg': msg}, ensure_ascii=False)}\n\n"
+
+    def generate():
+        try:
+            if acc_idx >= len(accounts):
+                yield send("❌ accountIdx 超出范围"); yield "data: __DONE__\n\n"; return
+            account    = accounts[acc_idx]
+            coze_token = account.get("cozeToken", "").strip()
+            wf1_id     = account.get("workflowId", "").strip()
+            app_token  = account.get("baseToken", "").strip()
+
+            if not coze_token:
+                yield send("❌ 所选账号未填写 Coze Token"); yield "data: __DONE__\n\n"; return
+            if not wf1_id:
+                yield send("❌ 所选账号未填写工作流1 ID"); yield "data: __DONE__\n\n"; return
+            if not table_id:
+                yield send("❌ 未选择子表"); yield "data: __DONE__\n\n"; return
+
+            # 构造飞书多维表格完整 URL
+            bitable_url = f"https://my.feishu.cn/base/{app_token}"
+            if table_id:
+                bitable_url += f"?table={table_id}"
+            if view_id:
+                bitable_url += f"&view={view_id}"
+
+            # input 参数：用传入的 products data，若为空传空数组
+            inp_data = []
+            for p in products:
+                inp_data.extend(p.get("data", []))
+
+            yield send(f"🚀 直接调用模式：子表「{table_name}」")
+            yield send(f"   URL: {bitable_url}")
+            yield send(f"   WF1: {wf1_id[:16]}…  input 条数: {len(inp_data)}")
+
+            result = _call_coze_sync(
+                coze_token, wf1_id, inp_data, table_name,
+                timeout=60, bitable_url=bitable_url
+            )
+            if result.get("code") == 0:
+                yield send(f"✅ WF1 触发成功！子表：{table_name}")
+            else:
+                yield send(f"⚠️ WF1 返回 code={result.get('code')} msg={result.get('msg','')[:120]}")
+
+        except Exception as e:
+            yield send(f"❌ 直接调用异常：{str(e)[:200]}")
+        yield "data: __DONE__\n\n"
+
+    return Response(stream_with_context(generate()), mimetype="text/event-stream",
+                    headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+
+
 # ============================================================
 # 钉钉在线表格同步
 # ============================================================
@@ -6196,10 +6678,75 @@ def dingtalk_sync():
         return jsonify({"ok": False, "msg": "钉钉未登录，请先扫码"}), 401
     try:
         import time as _t
+        from excel_parser import count_unique_text_rows as _count_lyrics
         content = _dingtalk_client.fetch_target_doc()
         products = scan_dingtalk_products(content)
         mode_map   = parse_mode_map(content)
         demand_map = parse_demand_map(content)
+
+        # 为每个产品计算 m1_lyrics / m2_lyrics（唯一台词套数）
+        # 逻辑：从 mode_map（汇总表）里找这个产品实际分配的日期和模式
+        #   - 模式1的日期 → 取该日期的单日模板 → 数唯一台词
+        #   - 模式2的日期 → 取该日期及前一日的合并模板 → 数唯一台词
+        from dingtalk_client import _norm_product as _norm_p
+        for p in products:
+            avail      = p.get("available_dates", [])
+            header_str = p.get("header_str", "")
+            templates  = p.get("templates", [])
+            sheet      = p.get("sheet", "")
+            pn_norm    = _norm_p(p.get("product_name", ""))
+
+            # 从 mode_map 找该产品所有有效日期及对应模式
+            m1_dates, m2_dates = [], []
+            for (g, pn, d), m in mode_map.items():
+                if g == sheet and pn == pn_norm:
+                    if m == 2:
+                        m2_dates.append(d)
+                    else:
+                        m1_dates.append(d)
+
+            # 模式1：取最近一个模式1任务日期 → 再找 ≤ 任务日的最近模板日 → 数台词
+            # 与 expand-tasks 逻辑一致：任务日 5.21 → 模板日 5.20 → 用 5.20 的模板
+            if m1_dates:
+                recent_m1 = find_recent_dates(m1_dates, "12.31", n=1)
+                task_date_m1 = recent_m1[0] if recent_m1 else m1_dates[-1]
+                nearest_m1 = find_recent_dates(avail, task_date_m1, n=1)
+                if nearest_m1:
+                    pool1 = filter_templates_by_date(p, nearest_m1[0])
+                    p["m1_lyrics"] = _count_lyrics(pool1 or templates, header_str)
+                else:
+                    p["m1_lyrics"] = 0
+            else:
+                p["m1_lyrics"] = 0   # 汇总表未配置模式1，不显示
+
+            # 模式2：取最近一个模式2任务日期，合并该日 + 前一日的模板
+            if m2_dates:
+                recent_m2 = find_recent_dates(m2_dates, "12.31", n=1)
+                d2_target = recent_m2[0] if recent_m2 else m2_dates[-1]
+                two_dates = find_recent_dates(avail, d2_target, n=2)
+                pool2 = []
+                for d in two_dates:
+                    pool2 += filter_templates_by_date(p, d)
+                p["m2_lyrics"] = _count_lyrics(pool2 or templates, header_str)
+            else:
+                p["m2_lyrics"] = 0   # 汇总表未配置模式2，不显示
+
+        # ── 诊断：检查汇总表"组名"与模板"Tab名"是否一致 ──
+        _summary_groups = set(g for (g, _, _) in mode_map.keys())
+        _template_sheets = set(p_["sheet"] for p_ in products)
+        _unmatched_groups = _summary_groups - _template_sheets
+        _unmatched_sheets = _template_sheets - _summary_groups
+        if _unmatched_groups or _unmatched_sheets:
+            print("⚠️ [sync 诊断] 汇总表组名 vs 模板Tab名 存在不匹配！")
+            print(f"   汇总表组名:  {sorted(_summary_groups)}")
+            print(f"   模板Tab名:   {sorted(_template_sheets)}")
+            if _unmatched_groups:
+                print(f"   ❌ 汇总表有但模板Tab无: {sorted(_unmatched_groups)}")
+            if _unmatched_sheets:
+                print(f"   ❌ 模板Tab有但汇总表无: {sorted(_unmatched_sheets)}")
+        else:
+            print(f"✅ [sync 诊断] 汇总表组名与模板Tab名完全一致：{sorted(_summary_groups)}")
+
         # 写缓存（供 expand-tasks 用）
         _dingtalk_cache["content"]  = content
         _dingtalk_cache["products"] = products
@@ -6412,6 +6959,8 @@ def index():
 class DesktopApi:
     def pick_folder(self):
         """弹出系统原生文件夹选择窗口，返回选中路径"""
+        if not _WEBVIEW_AVAILABLE:
+            return None
         result = webview.windows[0].create_file_dialog(webview.FileDialog.FOLDER)
         if result:
             return result[0]
@@ -6425,35 +6974,42 @@ class DesktopApi:
 # ============================================================
 # 启动：Flask 后台线程 + PyWebView 原生窗口
 # ============================================================
-def run_flask(port):
-    app.run(host="127.0.0.1", port=port, debug=False, threaded=True, use_reloader=False)
+def run_flask(port, host="127.0.0.1"):
+    app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)
 
 
 if __name__ == "__main__":
     import time, urllib.request
-    port = 5678
+    port = int(os.environ.get("PORT", 5678))
 
-    # 在后台线程启动 Flask
-    t = threading.Thread(target=run_flask, args=(port,), daemon=True)
-    t.start()
+    # 服务器模式：环境变量 SERVER_MODE=1 或 webview 不可用时，直接监听 0.0.0.0
+    server_mode = os.environ.get("SERVER_MODE", "0") == "1" or not _WEBVIEW_AVAILABLE
 
-    # 等 Flask 就绪
-    for _ in range(20):
-        try:
-            urllib.request.urlopen(f"http://127.0.0.1:{port}/")
-            break
-        except Exception:
-            time.sleep(0.3)
+    if server_mode:
+        print(f"🚀 服务器模式：启动 Flask 监听 0.0.0.0:{port}")
+        run_flask(port, host="0.0.0.0")
+    else:
+        # 桌面模式：Flask 在后台，webview 打开原生窗口
+        t = threading.Thread(target=run_flask, args=(port,), daemon=True)
+        t.start()
 
-    # 打开原生桌面窗口，注入 js_api
-    api = DesktopApi()
-    webview.create_window(
-        title="🎬 秀悦视频下载工具",
-        url=f"http://127.0.0.1:{port}/",
-        width=960,
-        height=760,
-        min_size=(720, 560),
-        resizable=True,
-        js_api=api,
-    )
-    webview.start()
+        # 等 Flask 就绪
+        for _ in range(20):
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/")
+                break
+            except Exception:
+                time.sleep(0.3)
+
+        # 打开原生桌面窗口，注入 js_api
+        api = DesktopApi()
+        webview.create_window(
+            title="🎬 秀悦视频下载工具",
+            url=f"http://127.0.0.1:{port}/",
+            width=960,
+            height=760,
+            min_size=(720, 560),
+            resizable=True,
+            js_api=api,
+        )
+        webview.start()
